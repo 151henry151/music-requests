@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Music Request</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 0 auto; padding: 1.5rem; background: #1a1a2e; color: #eaeaea; min-height: 100vh; }
+    h1 { color: #4cc9f0; margin-bottom: 0.5rem; }
+    .subtitle { color: #888; margin-bottom: 1.5rem; }
+    .card { background: #16213e; border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; }
+    .step { font-size: 0.85rem; color: #4cc9f0; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
+    input[type="text"], input[type="password"] { width: 100%; padding: 0.6rem 0.8rem; border: 1px solid #333; border-radius: 6px; background: #0f0f1a; color: #fff; font-size: 1rem; }
+    input:focus { outline: none; border-color: #4cc9f0; }
+    button { background: #4cc9f0; color: #1a1a2e; border: none; padding: 0.6rem 1.2rem; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 0.95rem; }
+    button:hover { background: #3ab5da; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-secondary { background: #333; color: #eaeaea; }
+    .btn-secondary:hover { background: #444; }
+    .list { list-style: none; padding: 0; margin: 0; }
+    .list li { padding: 0.75rem; border-bottom: 1px solid #222; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+    .list li:hover { background: #1f2d4a; }
+    .list li:last-child { border-bottom: none; }
+    .list li .meta { font-size: 0.8rem; color: #888; }
+    .artist-item { display: flex; align-items: center; gap: 1rem; }
+    .artist-item img { width: 48px; height: 48px; border-radius: 6px; object-fit: cover; flex-shrink: 0; background: #333; }
+    .album-item { display: flex; align-items: center; gap: 1rem; }
+    .album-item img { width: 48px; height: 48px; border-radius: 6px; object-fit: cover; flex-shrink: 0; background: #333; }
+    .list li .meta span { margin-right: 1rem; }
+    .flex { display: flex; gap: 0.75rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+    .hidden { display: none !important; }
+    .error { color: #f472b6; font-size: 0.9rem; margin-top: 0.5rem; }
+    .success { color: #6ee7b7; font-size: 0.9rem; margin-top: 0.5rem; }
+    .size { color: #888; }
+    .torrent-row { padding: 0.75rem; border-bottom: 1px solid #222; display: grid; grid-template-columns: 1fr auto; gap: 0.5rem; align-items: center; }
+    .torrent-row:hover { background: #1f2d4a; }
+    .torrent-row .name { font-weight: 500; }
+    .torrent-row .meta { font-size: 0.8rem; color: #888; }
+    .torrent-row button { padding: 0.4rem 0.8rem; font-size: 0.85rem; }
+    #login-form { max-width: 320px; }
+    .choice-btns { display: flex; gap: 0.5rem; margin: 0.5rem 0; }
+    .choice-btns button { flex: 1; }
+  </style>
+</head>
+<body>
+  <h1>Music Request</h1>
+  <p class="subtitle">Request albums or discographies to be added to the music library. Log in with your Airsonic credentials.</p>
+
+  <!-- Login -->
+  <div id="login-section" class="card">
+    <div class="step">Log in</div>
+    <form id="login-form">
+      <div class="flex" style="flex-direction: column; gap: 0.75rem;">
+        <input type="text" id="username" placeholder="Airsonic username" required autocomplete="username">
+        <input type="password" id="password" placeholder="Airsonic password" required autocomplete="current-password">
+        <button type="submit">Log in</button>
+      </div>
+      <p id="login-error" class="error hidden"></p>
+    </form>
+  </div>
+
+  <!-- Main flow (after login) -->
+  <div id="main-section" class="hidden">
+    <div class="card">
+      <div class="step">1. Search artist</div>
+      <div class="flex">
+        <input type="text" id="artist-query" placeholder="Artist name (e.g. Bon Jovi)">
+        <button id="search-artist">Search</button>
+      </div>
+      <p id="artist-error" class="error hidden"></p>
+      <ul id="artist-list" class="list hidden"></ul>
+    </div>
+
+    <div id="artist-picked-section" class="card hidden">
+      <div class="step">2. Choose request type</div>
+      <p>Artist: <strong id="picked-artist-name"></strong></p>
+      <div class="choice-btns">
+        <button id="btn-album" class="btn-secondary">Album</button>
+        <button id="btn-discography">Discography</button>
+      </div>
+
+      <!-- Album flow -->
+      <div id="album-flow" class="hidden">
+        <div class="step" style="margin-top: 1rem;">3. Pick album</div>
+        <ul id="album-list" class="list"></ul>
+      </div>
+
+      <!-- Discography flow -->
+      <div id="discography-flow" class="hidden">
+        <div class="step" style="margin-top: 1rem;">3. TPB results for discography</div>
+        <p id="discography-loading" class="hidden">Searching...</p>
+        <div id="discography-results"></div>
+      </div>
+      <!-- discography results built in JS -->
+
+      <!-- Album TPB results -->
+      <div id="album-tpb-flow" class="hidden">
+        <div class="step" style="margin-top: 1rem;">4. Pick torrent</div>
+        <p id="album-tpb-loading" class="hidden">Searching...</p>
+        <div id="album-tpb-results"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <button id="btn-back" class="btn-secondary hidden">← Back to artist search</button>
+    </div>
+  </div>
+
+  <script>
+    let creds = null;
+
+    function b64(s) { return btoa(unescape(encodeURIComponent(s))); }
+    function authHeader() {
+      if (!creds) return {};
+      return { Authorization: 'Basic ' + b64(creds.username + ':' + creds.password) };
+    }
+    function api(url, opts = {}) {
+      return fetch(url, { ...opts, headers: { 'Content-Type': 'application/json', ...authHeader(), ...opts.headers } });
+    }
+    function show(el, show) { el.classList.toggle('hidden', !show); }
+    function err(el, msg) { el.textContent = msg || ''; show(el, !!msg); }
+    function escapeHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function fmtSize(n) {
+      if (!n || n === 0) return '-';
+      const g = 1e9, m = 1e6, k = 1e3;
+      if (n >= g) return (n / g).toFixed(2) + ' GB';
+      if (n >= m) return (n / m).toFixed(2) + ' MB';
+      return (n / k).toFixed(1) + ' KB';
+    }
+    function renderTorrentResults(results, containerEl, emptyMsg) {
+      const seeded = results.filter(t => (t.seeders || 0) >= 1);
+      const unseeded = results.filter(t => (t.seeders || 0) === 0);
+      containerEl.innerHTML = '';
+      function addRow(t) {
+        const row = document.createElement('div');
+        row.className = 'torrent-row';
+        const mag = t.magnet;
+        row.innerHTML = '<div><div class="name">' + escapeHtml(t.name) + '</div><div class="meta"><span>' + t.seeders + ' seeders</span><span>' + t.leechers + ' leechers</span><span class="size">' + fmtSize(t.size) + '</span></div></div><button>Add</button>';
+        row.querySelector('button').onclick = () => addMagnet(mag);
+        containerEl.appendChild(row);
+      }
+      if (seeded.length === 0 && unseeded.length === 0) {
+        containerEl.innerHTML = '<p>' + emptyMsg + '</p>';
+        return;
+      }
+      seeded.forEach(addRow);
+      if (unseeded.length > 0) {
+        if (seeded.length === 0) {
+          const p = document.createElement('p');
+          p.className = 'meta';
+          p.textContent = 'No torrents with seeders. ';
+          containerEl.appendChild(p);
+        }
+        const zeroWrap = document.createElement('div');
+        zeroWrap.className = 'zero-seeders-section';
+        const zeroList = document.createElement('div');
+        zeroList.className = 'zero-seeders-list hidden';
+        unseeded.forEach(t => {
+          const row = document.createElement('div');
+          row.className = 'torrent-row';
+          const mag = t.magnet;
+          row.innerHTML = '<div><div class="name">' + escapeHtml(t.name) + '</div><div class="meta"><span>' + t.seeders + ' seeders</span><span>' + t.leechers + ' leechers</span><span class="size">' + fmtSize(t.size) + '</span></div></div><button>Add</button>';
+          row.querySelector('button').onclick = () => addMagnet(mag);
+          zeroList.appendChild(row);
+        });
+        const btn = document.createElement('button');
+        btn.className = 'btn-secondary';
+        btn.style.marginTop = '0.75rem';
+        btn.textContent = 'Show ' + unseeded.length + ' result' + (unseeded.length === 1 ? '' : 's') + ' with zero seeders';
+        btn.onclick = () => {
+          zeroList.classList.toggle('hidden');
+          btn.textContent = zeroList.classList.contains('hidden')
+            ? 'Show ' + unseeded.length + ' result' + (unseeded.length === 1 ? '' : 's') + ' with zero seeders'
+            : 'Hide zero-seeder results';
+        };
+        zeroWrap.appendChild(zeroList);
+        zeroWrap.appendChild(btn);
+        containerEl.appendChild(zeroWrap);
+      }
+    }
+
+    document.getElementById('login-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const u = document.getElementById('username').value.trim();
+      const p = document.getElementById('password').value;
+      const errEl = document.getElementById('login-error');
+      try {
+        const r = await api('/api/login', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
+        if (!r.ok) throw new Error('Invalid credentials');
+        creds = { username: u, password: p };
+        show(document.getElementById('login-section'), false);
+        show(document.getElementById('main-section'), true);
+        err(errEl);
+      } catch (e) {
+        err(errEl, e.message || 'Login failed');
+      }
+    };
+
+    let currentArtist = null;
+
+    document.getElementById('search-artist').onclick = async () => {
+      const q = document.getElementById('artist-query').value.trim();
+      const errEl = document.getElementById('artist-error');
+      const listEl = document.getElementById('artist-list');
+      if (q.length < 2) { err(errEl, 'Type at least 2 characters'); return; }
+      err(errEl);
+      listEl.innerHTML = '';
+      show(listEl, false);
+      try {
+        const r = await api('/api/artists?q=' + encodeURIComponent(q));
+        if (!r.ok) throw new Error('Search failed');
+        const { artists } = await r.json();
+        if (!artists.length) { err(errEl, 'No artists found'); return; }
+        artists.forEach(a => {
+          const li = document.createElement('li');
+          const div = document.createElement('div');
+          div.className = 'artist-item';
+          if (a.image) {
+            const img = document.createElement('img');
+            img.src = a.image;
+            img.alt = '';
+            img.loading = 'lazy';
+            div.appendChild(img);
+          }
+          const span = document.createElement('span');
+          span.textContent = a.name + (a.type ? ' (' + a.type + ')' : '');
+          div.appendChild(span);
+          li.appendChild(div);
+          li.dataset.id = a.id;
+          li.dataset.name = a.name;
+          li.onclick = () => pickArtist(a.id, a.name);
+          listEl.appendChild(li);
+        });
+        show(listEl, true);
+      } catch (e) {
+        err(errEl, e.message || 'Search failed');
+      }
+    };
+
+    function pickArtist(id, name) {
+      currentArtist = { id, name };
+      document.getElementById('picked-artist-name').textContent = name;
+      show(document.getElementById('artist-list'), false);
+      show(document.getElementById('artist-picked-section'), true);
+      show(document.getElementById('album-flow'), false);
+      show(document.getElementById('discography-flow'), false);
+      show(document.getElementById('album-tpb-flow'), false);
+      show(document.getElementById('btn-back'), true);
+    }
+
+    document.getElementById('btn-album').onclick = async () => {
+      show(document.getElementById('album-flow'), true);
+      show(document.getElementById('discography-flow'), false);
+      show(document.getElementById('album-tpb-flow'), false);
+      const listEl = document.getElementById('album-list');
+      listEl.innerHTML = '<li>Loading...</li>';
+      try {
+        const r = await api('/api/albums/' + currentArtist.id);
+        if (!r.ok) throw new Error('Failed to load albums');
+        const { albums } = await r.json();
+        listEl.innerHTML = '';
+        if (!albums.length) { listEl.innerHTML = '<li>No albums found</li>'; return; }
+        albums.forEach(a => {
+          const li = document.createElement('li');
+          const div = document.createElement('div');
+          div.className = 'album-item';
+          if (a.image) {
+            const img = document.createElement('img');
+            img.src = a.image;
+            img.alt = '';
+            img.loading = 'lazy';
+            img.onerror = () => { img.style.display = 'none'; };
+            div.appendChild(img);
+          }
+          const titleSpan = document.createElement('span');
+          titleSpan.textContent = a.title + (a.date ? ' (' + a.date + ')' : '');
+          div.appendChild(titleSpan);
+          const metaSpan = document.createElement('span');
+          metaSpan.className = 'meta';
+          metaSpan.textContent = a.type || '';
+          li.appendChild(div);
+          li.appendChild(metaSpan);
+          li.dataset.title = a.title;
+          li.onclick = () => searchAlbumTpb(a.title);
+          listEl.appendChild(li);
+        });
+      } catch (e) {
+        listEl.innerHTML = '<li class="error">' + (e.message || 'Failed') + '</li>';
+      }
+    };
+
+    document.getElementById('btn-discography').onclick = async () => {
+      show(document.getElementById('album-flow'), false);
+      show(document.getElementById('discography-flow'), true);
+      show(document.getElementById('album-tpb-flow'), false);
+      const resEl = document.getElementById('discography-results');
+      const loadEl = document.getElementById('discography-loading');
+      resEl.innerHTML = '';
+      show(loadEl, true);
+      try {
+        const q = currentArtist.name + ' Discography';
+        const r = await api('/api/search-tpb?q=' + encodeURIComponent(q));
+        if (!r.ok) throw new Error('Search failed');
+        const { results } = await r.json();
+        show(loadEl, false);
+        if (!results.length) { resEl.innerHTML = '<p>No discography torrents found.</p>'; return; }
+        renderTorrentResults(results, resEl, 'No discography torrents found.');
+      } catch (e) {
+        show(loadEl, false);
+        resEl.innerHTML = '<p class="error">' + (e.message || 'Search failed') + '</p>';
+      }
+    };
+
+    async function searchAlbumTpb(albumTitle) {
+      show(document.getElementById('album-flow'), false);
+      show(document.getElementById('album-tpb-flow'), true);
+      const resEl = document.getElementById('album-tpb-results');
+      const loadEl = document.getElementById('album-tpb-loading');
+      resEl.innerHTML = '';
+      show(loadEl, true);
+      try {
+        const q = currentArtist.name + ' ' + albumTitle;
+        const r = await api('/api/search-tpb?q=' + encodeURIComponent(q));
+        if (!r.ok) throw new Error('Search failed');
+        const { results } = await r.json();
+        show(loadEl, false);
+        if (!results.length) { resEl.innerHTML = '<p>No torrents found.</p>'; return; }
+        renderTorrentResults(results, resEl, 'No torrents found.');
+      } catch (e) {
+        show(loadEl, false);
+        resEl.innerHTML = '<p class="error">' + (e.message || 'Search failed') + '</p>';
+      }
+    }
+
+    async function addMagnet(magnet) {
+      try {
+        const r = await api('/api/add-torrent', { method: 'POST', body: JSON.stringify({ magnet }) });
+        if (!r.ok) throw new Error('Failed to add');
+        alert('Torrent added! It will be imported automatically when the download completes. Note: depending on availability of seeders, this may take anywhere from several hours to several days before the music appears on the server.');
+      } catch (e) {
+        alert('Error: ' + (e.message || 'Failed to add torrent'));
+      }
+    }
+
+    document.getElementById('btn-back').onclick = () => {
+      currentArtist = null;
+      show(document.getElementById('artist-picked-section'), false);
+      show(document.getElementById('btn-back'), false);
+      document.getElementById('artist-query').value = '';
+      document.getElementById('artist-list').innerHTML = '';
+      show(document.getElementById('artist-list'), true);
+    };
+  </script>
+</body>
+</html>

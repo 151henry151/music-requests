@@ -41,6 +41,10 @@
     #login-form { max-width: 320px; }
     .choice-btns { display: flex; gap: 0.5rem; margin: 0.5rem 0; }
     .choice-btns button { flex: 1; }
+    .source-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; flex-wrap: wrap; }
+    .source-label { font-size: 0.85rem; color: #888; margin-right: 0.25rem; }
+    .hint { font-size: 0.85rem; color: #888; margin: 0.5rem 0 0.75rem; }
+    .status-line { margin-top: 0.75rem; }
   </style>
 </head>
 <body>
@@ -83,6 +87,12 @@
       <!-- Album flow -->
       <div id="album-flow" class="hidden">
         <div class="step" style="margin-top: 1rem;">3. Pick album</div>
+        <div class="source-row">
+          <span class="source-label">Source:</span>
+          <button id="btn-source-torrent">Torrent</button>
+          <button id="btn-source-youtube" class="btn-secondary">YouTube</button>
+        </div>
+        <p class="hint">Choose YouTube to search and rip from YouTube directly, or Torrent to search TPB first.</p>
         <ul id="album-list" class="list"></ul>
       </div>
 
@@ -100,6 +110,14 @@
         <p id="album-tpb-loading" class="hidden">Searching...</p>
         <div id="album-tpb-results"></div>
       </div>
+
+      <!-- Album YouTube results -->
+      <div id="album-yt-flow" class="hidden">
+        <div class="step" style="margin-top: 1rem;">4. Pick YouTube result and rip</div>
+        <p id="album-yt-loading" class="hidden">Searching YouTube...</p>
+        <div id="album-yt-results"></div>
+        <p id="album-yt-status" class="success status-line hidden"></p>
+      </div>
     </div>
 
     <div class="card">
@@ -109,6 +127,8 @@
 
   <script>
     let creds = null;
+    let currentArtist = null;
+    let albumSearchSource = 'torrent';
 
     function b64(s) { return btoa(unescape(encodeURIComponent(s))); }
     function authHeader() {
@@ -118,7 +138,7 @@
     function api(url, opts = {}) {
       return fetch(url, { ...opts, headers: { 'Content-Type': 'application/json', ...authHeader(), ...opts.headers } });
     }
-    function show(el, show) { el.classList.toggle('hidden', !show); }
+    function show(el, on) { el.classList.toggle('hidden', !on); }
     function err(el, msg) { el.textContent = msg || ''; show(el, !!msg); }
     function escapeHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
     function fmtSize(n) {
@@ -128,6 +148,23 @@
       if (n >= m) return (n / m).toFixed(2) + ' MB';
       return (n / k).toFixed(1) + ' KB';
     }
+
+    function setAlbumSource(source) {
+      albumSearchSource = source === 'youtube' ? 'youtube' : 'torrent';
+      document.getElementById('btn-source-torrent').className = albumSearchSource === 'torrent' ? '' : 'btn-secondary';
+      document.getElementById('btn-source-youtube').className = albumSearchSource === 'youtube' ? '' : 'btn-secondary';
+    }
+
+    function clearAlbumResults() {
+      document.getElementById('album-tpb-results').innerHTML = '';
+      document.getElementById('album-yt-results').innerHTML = '';
+      err(document.getElementById('album-yt-status'));
+      show(document.getElementById('album-tpb-loading'), false);
+      show(document.getElementById('album-yt-loading'), false);
+      show(document.getElementById('album-tpb-flow'), false);
+      show(document.getElementById('album-yt-flow'), false);
+    }
+
     function renderTorrentResults(results, containerEl, emptyMsg) {
       const seeded = results.filter(t => (t.seeders || 0) >= 1);
       const unseeded = results.filter(t => (t.seeders || 0) === 0);
@@ -149,19 +186,17 @@
         if (seeded.length === 0) {
           const p = document.createElement('p');
           p.className = 'meta';
-          p.textContent = 'No torrents with seeders. ';
+          p.textContent = 'No torrents with seeders.';
           containerEl.appendChild(p);
         }
         const zeroWrap = document.createElement('div');
-        zeroWrap.className = 'zero-seeders-section';
         const zeroList = document.createElement('div');
-        zeroList.className = 'zero-seeders-list hidden';
+        zeroList.className = 'hidden';
         unseeded.forEach(t => {
           const row = document.createElement('div');
           row.className = 'torrent-row';
-          const mag = t.magnet;
           row.innerHTML = '<div><div class="name">' + escapeHtml(t.name) + '</div><div class="meta"><span>' + t.seeders + ' seeders</span><span>' + t.leechers + ' leechers</span><span class="size">' + fmtSize(t.size) + '</span></div></div><button>Add</button>';
-          row.querySelector('button').onclick = () => addMagnet(mag);
+          row.querySelector('button').onclick = () => addMagnet(t.magnet);
           zeroList.appendChild(row);
         });
         const btn = document.createElement('button');
@@ -180,6 +215,23 @@
       }
     }
 
+    function renderYouTubeResults(results, containerEl, album) {
+      containerEl.innerHTML = '';
+      if (!results.length) {
+        containerEl.innerHTML = '<p>No YouTube results found for this album query.</p>';
+        return;
+      }
+      results.forEach(v => {
+        const row = document.createElement('div');
+        row.className = 'torrent-row';
+        const duration = v.duration_human || '-';
+        row.innerHTML = '<div><div class="name">' + escapeHtml(v.title || 'Untitled') + '</div><div class="meta"><span>' + escapeHtml(v.channel || 'Unknown channel') + '</span><span>' + escapeHtml(duration) + '</span></div></div><button>Rip</button>';
+        const btn = row.querySelector('button');
+        btn.onclick = () => ripYouTubeResult(v, album, btn);
+        containerEl.appendChild(row);
+      });
+    }
+
     document.getElementById('login-form').onsubmit = async (e) => {
       e.preventDefault();
       const u = document.getElementById('username').value.trim();
@@ -196,8 +248,6 @@
         err(errEl, e.message || 'Login failed');
       }
     };
-
-    let currentArtist = null;
 
     document.getElementById('search-artist').onclick = async () => {
       const q = document.getElementById('artist-query').value.trim();
@@ -227,8 +277,6 @@
           span.textContent = a.name + (a.type ? ' (' + a.type + ')' : '');
           div.appendChild(span);
           li.appendChild(div);
-          li.dataset.id = a.id;
-          li.dataset.name = a.name;
           li.onclick = () => pickArtist(a.id, a.name);
           listEl.appendChild(li);
         });
@@ -241,22 +289,26 @@
     function pickArtist(id, name) {
       currentArtist = { id, name };
       document.getElementById('picked-artist-name').textContent = name;
+      setAlbumSource('torrent');
       show(document.getElementById('artist-list'), false);
       show(document.getElementById('artist-picked-section'), true);
       show(document.getElementById('album-flow'), false);
       show(document.getElementById('discography-flow'), false);
-      show(document.getElementById('album-tpb-flow'), false);
+      clearAlbumResults();
       show(document.getElementById('btn-back'), true);
     }
+
+    document.getElementById('btn-source-torrent').onclick = () => setAlbumSource('torrent');
+    document.getElementById('btn-source-youtube').onclick = () => setAlbumSource('youtube');
 
     document.getElementById('btn-album').onclick = async () => {
       show(document.getElementById('album-flow'), true);
       show(document.getElementById('discography-flow'), false);
-      show(document.getElementById('album-tpb-flow'), false);
+      clearAlbumResults();
       const listEl = document.getElementById('album-list');
       listEl.innerHTML = '<li>Loading...</li>';
       try {
-        const r = await api('/api/albums/' + currentArtist.id);
+        const r = await api('/api/albums/' + encodeURIComponent(currentArtist.id));
         if (!r.ok) throw new Error('Failed to load albums');
         const { albums } = await r.json();
         listEl.innerHTML = '';
@@ -281,8 +333,7 @@
           metaSpan.textContent = a.type || '';
           li.appendChild(div);
           li.appendChild(metaSpan);
-          li.dataset.title = a.title;
-          li.onclick = () => searchAlbumTpb(a.title);
+          li.onclick = () => searchAlbumBySource(a);
           listEl.appendChild(li);
         });
       } catch (e) {
@@ -293,7 +344,7 @@
     document.getElementById('btn-discography').onclick = async () => {
       show(document.getElementById('album-flow'), false);
       show(document.getElementById('discography-flow'), true);
-      show(document.getElementById('album-tpb-flow'), false);
+      clearAlbumResults();
       const resEl = document.getElementById('discography-results');
       const loadEl = document.getElementById('discography-loading');
       resEl.innerHTML = '';
@@ -312,24 +363,100 @@
       }
     };
 
-    async function searchAlbumTpb(albumTitle) {
+    async function searchAlbumBySource(album) {
+      if (albumSearchSource === 'youtube') {
+        await searchAlbumYouTube(album);
+      } else {
+        await searchAlbumTpb(album);
+      }
+    }
+
+    async function searchAlbumTpb(album) {
       show(document.getElementById('album-flow'), false);
       show(document.getElementById('album-tpb-flow'), true);
+      show(document.getElementById('album-yt-flow'), false);
       const resEl = document.getElementById('album-tpb-results');
       const loadEl = document.getElementById('album-tpb-loading');
       resEl.innerHTML = '';
       show(loadEl, true);
       try {
-        const q = currentArtist.name + ' ' + albumTitle;
+        const q = currentArtist.name + ' ' + album.title;
         const r = await api('/api/search-tpb?q=' + encodeURIComponent(q));
         if (!r.ok) throw new Error('Search failed');
         const { results } = await r.json();
         show(loadEl, false);
-        if (!results.length) { resEl.innerHTML = '<p>No torrents found.</p>'; return; }
+        if (!results.length) {
+          resEl.innerHTML = '<p>No torrents found for this album.</p>';
+          const btn = document.createElement('button');
+          btn.textContent = 'Search YouTube for this album';
+          btn.onclick = () => searchAlbumYouTube(album);
+          resEl.appendChild(btn);
+          return;
+        }
         renderTorrentResults(results, resEl, 'No torrents found.');
+        const altBtn = document.createElement('button');
+        altBtn.className = 'btn-secondary';
+        altBtn.style.marginTop = '0.75rem';
+        altBtn.textContent = 'Search YouTube for this album instead';
+        altBtn.onclick = () => searchAlbumYouTube(album);
+        resEl.appendChild(altBtn);
       } catch (e) {
         show(loadEl, false);
         resEl.innerHTML = '<p class="error">' + (e.message || 'Search failed') + '</p>';
+      }
+    }
+
+    async function searchAlbumYouTube(album) {
+      show(document.getElementById('album-flow'), false);
+      show(document.getElementById('album-yt-flow'), true);
+      show(document.getElementById('album-tpb-flow'), false);
+      const resEl = document.getElementById('album-yt-results');
+      const loadEl = document.getElementById('album-yt-loading');
+      err(document.getElementById('album-yt-status'));
+      resEl.innerHTML = '';
+      show(loadEl, true);
+      try {
+        const q = currentArtist.name + ' ' + album.title + ' full album';
+        const r = await api('/api/search-youtube?q=' + encodeURIComponent(q));
+        const body = await r.json();
+        if (!r.ok) throw new Error(body.detail || 'Search failed');
+        show(loadEl, false);
+        renderYouTubeResults(body.results || [], resEl, album);
+      } catch (e) {
+        show(loadEl, false);
+        resEl.innerHTML = '<p class="error">' + (e.message || 'Search failed') + '</p>';
+      }
+    }
+
+    async function ripYouTubeResult(video, album, btn) {
+      const statusEl = document.getElementById('album-yt-status');
+      const prevLabel = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Ripping...';
+      err(statusEl, '');
+      try {
+        const payload = {
+          url: video.url || video.id,
+          artist: currentArtist.name,
+          album: album.title,
+          year: album.date || null
+        };
+        const r = await api('/api/rip-youtube', { method: 'POST', body: JSON.stringify(payload) });
+        const body = await r.json();
+        if (!r.ok) throw new Error(body.detail || 'Rip failed');
+        const scanMsg = body.airsonic_scan_triggered
+          ? 'Airsonic scan triggered.'
+          : 'Album saved. Airsonic scan was not triggered (or was not permitted).';
+        err(statusEl, 'Ripped ' + body.tracks_added + ' track(s) to ' + body.output_dir + '. ' + scanMsg);
+        statusEl.classList.remove('error');
+        statusEl.classList.add('success');
+      } catch (e) {
+        err(statusEl, e.message || 'Rip failed');
+        statusEl.classList.remove('success');
+        statusEl.classList.add('error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prevLabel;
       }
     }
 
@@ -350,6 +477,7 @@
       document.getElementById('artist-query').value = '';
       document.getElementById('artist-list').innerHTML = '';
       show(document.getElementById('artist-list'), true);
+      clearAlbumResults();
     };
   </script>
 </body>

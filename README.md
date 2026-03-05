@@ -13,6 +13,7 @@ A Jellyseerr-style web app for Airsonic/Subsonic users to request music. Search 
 - **qBittorrent integration** — Add magnets directly with category `lidarr` for Lidarr import
 - **YouTube album search** — Resolve the matched YouTube Music artist and list release playlists for album requests
 - **YouTube ripping** — Rip audio tracks from YouTube videos/playlists with embedded metadata and cover art
+- **Async rip jobs** — Run long YouTube rips as background jobs with live progress updates
 
 ## Flow
 
@@ -23,7 +24,8 @@ A Jellyseerr-style web app for Airsonic/Subsonic users to request music. Search 
    - **Torrent**: search TPB and add a magnet to qBittorrent
    - **YouTube**: match the artist on YouTube Music, show release playlists, and click **Rip** to import directly
 5. If torrent search returns no album results, click **Search YouTube for this album** as fallback
-6. YouTube rips are written to `YT_IMPORT_DIR` as tagged MP3 files with embedded cover art
+6. Click **Rip** to start an async rip job and watch live status/progress in the UI
+7. YouTube rips are written to `YT_IMPORT_DIR` as tagged MP3 files with embedded cover art
 
 ## Prerequisites
 
@@ -93,8 +95,9 @@ music-requests:
 - Playlist URLs are downloaded track-by-track using playlist order.
 - Single videos with chapters are split into per-chapter tracks.
 - Single videos without chapters are imported as one track.
-- Output files are tagged with Artist, Album, Track Number, Title, and optional Year.
+- Output files are tagged with Artist, Album Artist, Album, Track Number, Title, and optional Year.
 - Cover art is pulled from the YouTube thumbnail, copied into the album directory (`cover.jpg` / `folder.jpg`), and embedded into MP3 tags.
+- The rip job verifies final tags and embedded cover art per track before marking the job complete.
 
 ## Reverse Proxy (Nginx)
 

@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add UI controls to choose Torrent or YouTube as the album search source.
 - Add UI fallback action to search YouTube when torrent album search returns no results.
 - Add a UI YouTube results panel with per-result Rip actions.
+- Add async YouTube rip job status endpoint (`/api/rip-youtube/jobs/{job_id}`) for live progress updates.
 
 ### Changed
 
@@ -26,3 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Return artist release playlists from the matched YouTube Music artist channel for album-mode search results.
 - Add matched-artist channel context to the YouTube results UI and pass artist/album hints to `/api/search-youtube`.
 - Add `ytmusicapi` to runtime dependencies for artist and release resolution.
+- Change `/api/rip-youtube` to queue background rip jobs instead of holding a single long-running HTTP request.
+- Show continuous step-by-step YouTube rip progress and percentage updates in the web UI.
+- Change YouTube result rows marked as already ripped from disabled buttons to optional re-rip actions.
+- Add album artist tags and per-track metadata/cover verification checks before marking rip jobs complete.
+- Parse Airsonic scan responses robustly so JSON responses with formatted whitespace are detected as successful.

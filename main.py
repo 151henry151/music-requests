@@ -21,9 +21,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import urllib.parse
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -68,6 +72,26 @@ TRIGGER_AIRSONIC_SCAN = os.environ.get("TRIGGER_AIRSONIC_SCAN", "true").strip().
 logger = logging.getLogger("music_requests")
 YT_MUSIC_BASE = "https://music.youtube.com"
 _ytmusic_client: YTMusic | None = None
+RIP_JOB_RETENTION_SECONDS = max(_env_int("RIP_JOB_RETENTION_SECONDS", 86400), 600)
+
+
+@dataclass
+class RipJob:
+    id: str
+    requested_by: str
+    request: dict
+    status: str = "queued"  # queued | running | completed | failed
+    progress_percent: float = 0.0
+    step: str = "Queued"
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    log: list[str] = field(default_factory=list)
+    error: str | None = None
+    result: dict | None = None
+
+
+RIP_JOBS: dict[str, RipJob] = {}
+RIP_JOBS_LOCK = threading.Lock()
 
 
 # --- Models ---
@@ -109,6 +133,61 @@ class RipYouTubeRequest(BaseModel):
     artist: str
     album: str
     year: str | None = None
+
+
+def _cleanup_old_jobs() -> None:
+    cutoff = time.time() - RIP_JOB_RETENTION_SECONDS
+    stale = [jid for jid, job in RIP_JOBS.items() if job.updated_at < cutoff and job.status in ("completed", "failed")]
+    for jid in stale:
+        RIP_JOBS.pop(jid, None)
+
+
+def _job_snapshot(job: RipJob) -> dict:
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "progress_percent": round(job.progress_percent, 2),
+        "step": job.step,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "log": job.log[-400:],
+        "error": job.error,
+        "result": job.result,
+    }
+
+
+def _update_job(job_id: str, *, status: str | None = None, step: str | None = None, percent: float | None = None,
+                log_line: str | None = None, error: str | None = None, result: dict | None = None) -> None:
+    with RIP_JOBS_LOCK:
+        job = RIP_JOBS.get(job_id)
+        if not job:
+            return
+        if status:
+            job.status = status
+        if step is not None:
+            job.step = step
+        if percent is not None:
+            job.progress_percent = max(0.0, min(float(percent), 100.0))
+        if log_line:
+            job.log.append(log_line)
+            if len(job.log) > 1200:
+                job.log = job.log[-1200:]
+        if error is not None:
+            job.error = error
+        if result is not None:
+            job.result = result
+        job.updated_at = time.time()
+        _cleanup_old_jobs()
+
+
+def _get_job_for_user(job_id: str, username: str) -> RipJob:
+    with RIP_JOBS_LOCK:
+        job = RIP_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Rip job not found")
+    if job.requested_by != username:
+        raise HTTPException(status_code=403, detail="Not allowed to access this rip job")
+    return job
 
 
 # --- Auth: verify Airsonic credentials via Subsonic ping ---
@@ -560,8 +639,42 @@ def _download_cover_jpg(urls: list[str], target_dir: Path) -> Path | None:
     return None
 
 
-def _download_audio_sync(source_url: str, work_dir: Path, prefix: str) -> tuple[Path, dict]:
+def _progress_percent_from_hook(data: dict) -> float | None:
+    total = data.get("total_bytes") or data.get("total_bytes_estimate")
+    downloaded = data.get("downloaded_bytes")
+    if total and downloaded is not None:
+        try:
+            return max(0.0, min(float(downloaded) / float(total) * 100.0, 100.0))
+        except Exception:
+            pass
+    pct_str = str(data.get("_percent_str") or "").strip()
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", pct_str)
+    if m:
+        try:
+            return max(0.0, min(float(m.group(1)), 100.0))
+        except ValueError:
+            return None
+    return None
+
+
+def _download_audio_sync(
+    source_url: str,
+    work_dir: Path,
+    prefix: str,
+    *,
+    progress_cb: Callable[[float, str], None] | None = None,
+) -> tuple[Path, dict]:
     opts = _yt_dlp_common_opts()
+    if progress_cb:
+        def _hook(hook_data: dict) -> None:
+            status = hook_data.get("status")
+            if status == "downloading":
+                pct = _progress_percent_from_hook(hook_data)
+                if pct is not None:
+                    progress_cb(pct, "Downloading audio")
+            elif status == "finished":
+                progress_cb(100.0, "Download finished; extracting MP3")
+        opts["progress_hooks"] = [_hook]
     opts.update({
         "format": "bestaudio/best",
         "outtmpl": str(work_dir / f"{prefix}-%(id)s.%(ext)s"),
@@ -614,6 +727,7 @@ def _tag_mp3(
 
     tags["title"] = [title]
     tags["artist"] = [artist]
+    tags["albumartist"] = [artist]
     tags["album"] = [album]
     tags["tracknumber"] = [f"{track_no}/{total_tracks}"]
     if year:
@@ -652,6 +766,64 @@ def _split_by_chapters(source_mp3: Path, chapters: list[dict], out_dir: Path) ->
     return out
 
 
+def _verify_mp3_tags(file_path: Path, *, artist: str, album: str, title: str, track_no: int, year: str | None) -> dict:
+    issues: list[str] = []
+    expected_year = (year or "").strip()
+    try:
+        tags = EasyID3(str(file_path))
+    except Exception as e:
+        return {
+            "file": file_path.name,
+            "ok": False,
+            "issues": [f"Cannot read ID3 tags: {e}"],
+            "cover_embedded": False,
+        }
+
+    def _first(name: str) -> str:
+        vals = tags.get(name, [])
+        return vals[0] if vals else ""
+
+    actual_title = _first("title")
+    actual_artist = _first("artist")
+    actual_album = _first("album")
+    actual_album_artist = _first("albumartist")
+    actual_track = _first("tracknumber")
+    actual_date = _first("date")
+    if actual_title != title:
+        issues.append(f"title mismatch: expected '{title}', got '{actual_title}'")
+    if actual_artist != artist:
+        issues.append(f"artist mismatch: expected '{artist}', got '{actual_artist}'")
+    if actual_album != album:
+        issues.append(f"album mismatch: expected '{album}', got '{actual_album}'")
+    if actual_album_artist != artist:
+        issues.append(f"albumartist mismatch: expected '{artist}', got '{actual_album_artist}'")
+    if not actual_track.startswith(f"{track_no}/"):
+        issues.append(f"tracknumber mismatch: expected prefix '{track_no}/', got '{actual_track}'")
+    if expected_year and actual_date != expected_year:
+        issues.append(f"date mismatch: expected '{expected_year}', got '{actual_date}'")
+
+    try:
+        id3 = ID3(str(file_path))
+        cover_count = len(id3.getall("APIC"))
+    except Exception:
+        cover_count = 0
+    if cover_count < 1:
+        issues.append("cover art not embedded")
+
+    return {
+        "file": file_path.name,
+        "ok": len(issues) == 0,
+        "issues": issues,
+        "cover_embedded": cover_count > 0,
+        "title": actual_title,
+        "artist": actual_artist,
+        "album": actual_album,
+        "albumartist": actual_album_artist,
+        "tracknumber": actual_track,
+        "date": actual_date,
+    }
+
+
 def _unique_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -663,10 +835,26 @@ def _unique_path(path: Path) -> Path:
         i += 1
 
 
-def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None, progress_log: list[str] | None = None) -> dict:
+def _rip_youtube_sync(
+    url: str,
+    artist: str,
+    album: str,
+    year: str | None,
+    progress_log: list[str] | None = None,
+    progress_cb: Callable[[float, str], None] | None = None,
+) -> dict:
+    def emit(step: str, percent: float | None = None) -> None:
+        pct = max(0.0, min(percent if percent is not None else 0.0, 100.0))
+        if progress_log is not None:
+            if percent is None:
+                progress_log.append(step)
+            else:
+                progress_log.append(f"[{pct:.1f}%] {step}")
+        if progress_cb is not None:
+            progress_cb(pct, step)
+
     source_url = _normalize_youtube_url(url)
-    if progress_log is not None:
-        progress_log.append(f"Resolved URL: {source_url}")
+    emit(f"Resolved URL: {source_url}", 1.0)
     import_root = Path(YT_IMPORT_DIR)
     import_root.mkdir(parents=True, exist_ok=True)
 
@@ -676,8 +864,7 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None, progr
     album_dir_name = f"{safe_album} ({clean_year})" if clean_year else safe_album
     album_dir = import_root / safe_artist / album_dir_name
     album_dir.mkdir(parents=True, exist_ok=True)
-    if progress_log is not None:
-        progress_log.append(f"Output directory: {album_dir}")
+    emit(f"Output directory: {album_dir}", 2.5)
 
     with tempfile.TemporaryDirectory(prefix="yt-rip-", dir=str(import_root)) as tmp:
         tmp_dir = Path(tmp)
@@ -685,8 +872,7 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None, progr
         info_opts.update({"skip_download": True})
         with yt_dlp.YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(source_url, download=False)
-        if progress_log is not None:
-            progress_log.append("Fetched metadata")
+        emit("Fetched source metadata", 8.0)
 
         cover_path = _download_cover_jpg(_collect_cover_urls(info), tmp_dir)
         final_cover: Path | None = None
@@ -696,10 +882,17 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None, progr
             folder_cover = album_dir / "folder.jpg"
             if not folder_cover.exists():
                 shutil.copy2(cover_path, folder_cover)
+            emit("Downloaded and saved cover art", 12.0)
+        else:
+            emit("No cover art could be downloaded; proceeding without embedded art", 12.0)
 
         track_sources: list[tuple[Path, str]] = []
+        expected_tracks = 0
+        download_start = 12.0
+        download_span = 68.0
         if info.get("_type") == "playlist" and info.get("entries"):
             entries = [e for e in info.get("entries", []) if e]
+            expected_tracks = len(entries)
             for idx, entry in enumerate(entries, start=1):
                 entry_url = entry.get("webpage_url") or entry.get("url") or ""
                 if entry_url and not str(entry_url).startswith("http"):
@@ -707,29 +900,49 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None, progr
                     entry_url = f"https://www.youtube.com/watch?v={entry_id}" if entry_id else ""
                 if not entry_url:
                     continue
-                audio_path, entry_info = _download_audio_sync(str(entry_url), tmp_dir, f"track-{idx:03d}")
+                title_hint = (entry.get("title") or f"Track {idx}").strip()
+                track_base = download_start + ((idx - 1) / max(expected_tracks, 1)) * download_span
+                track_span = download_span / max(expected_tracks, 1)
+                emit(f"Downloading track {idx}/{expected_tracks}: {title_hint}", track_base)
+                audio_path, entry_info = _download_audio_sync(
+                    str(entry_url),
+                    tmp_dir,
+                    f"track-{idx:03d}",
+                    progress_cb=lambda pct, msg, idx=idx, title_hint=title_hint, track_base=track_base, track_span=track_span:
+                    emit(f"{msg} ({idx}/{expected_tracks}: {title_hint})", track_base + (track_span * (pct / 100.0))),
+                )
                 title = (entry.get("title") or entry_info.get("title") or f"Track {idx}").strip()
                 track_sources.append((audio_path, title))
+                emit(f"Finished downloading track {idx}/{expected_tracks}: {title}", track_base + track_span)
         else:
-            audio_path, downloaded_info = _download_audio_sync(source_url, tmp_dir, "album")
+            expected_tracks = 1
+            emit("Downloading source audio", download_start)
+            audio_path, downloaded_info = _download_audio_sync(
+                source_url,
+                tmp_dir,
+                "album",
+                progress_cb=lambda pct, msg: emit(msg, download_start + (download_span * (pct / 100.0))),
+            )
             chapters = downloaded_info.get("chapters") or info.get("chapters") or []
             usable_chapters = [
                 c for c in chapters
                 if float(c.get("end_time") or 0.0) > float(c.get("start_time") or 0.0) and c.get("title")
             ]
             if len(usable_chapters) >= 2:
+                emit(f"Splitting source into {len(usable_chapters)} chapter tracks", 82.0)
                 track_sources = _split_by_chapters(audio_path, usable_chapters, tmp_dir)
+                expected_tracks = len(track_sources)
             else:
                 title = (downloaded_info.get("title") or info.get("title") or album).strip()
                 track_sources = [(audio_path, title)]
 
-        if progress_log is not None:
-            progress_log.append(f"Processing {len(track_sources)} track(s)")
+        emit(f"Preparing to tag {len(track_sources)} track(s)", 83.0)
         if not track_sources:
             raise RuntimeError("No tracks were produced from the YouTube source")
 
         total_tracks = len(track_sources)
         saved_files: list[str] = []
+        verification: list[dict] = []
         for idx, (source_file, title) in enumerate(track_sources, start=1):
             safe_title = _safe_path_component(title, f"Track {idx}")
             final_path = _unique_path(album_dir / f"{idx:02d} - {safe_title}.mp3")
@@ -745,13 +958,31 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None, progr
                 cover_path=final_cover,
             )
             saved_files.append(final_path.name)
-            if progress_log is not None:
-                progress_log.append(f"Tagged: {final_path.name}")
+            verification.append(_verify_mp3_tags(
+                final_path,
+                artist=artist.strip() or safe_artist,
+                album=album.strip() or safe_album,
+                title=title,
+                track_no=idx,
+                year=clean_year or None,
+            ))
+            emit(f"Tagged track {idx}/{total_tracks}: {final_path.name}", 83.0 + (17.0 * idx / max(total_tracks, 1)))
+
+    metadata_ok = all(v.get("ok") for v in verification)
+    cover_ok = all(v.get("cover_embedded") for v in verification) if verification else False
+    emit("Rip complete", 100.0)
 
     return {
         "tracks_added": len(saved_files),
+        "expected_tracks": expected_tracks,
         "output_dir": str(album_dir),
         "tracks": saved_files,
+        "cover_saved": bool((album_dir / "cover.jpg").exists()),
+        "verification": {
+            "all_metadata_ok": metadata_ok,
+            "all_cover_embedded": cover_ok,
+            "tracks": verification,
+        },
     }
 
 
@@ -770,12 +1001,69 @@ async def trigger_airsonic_scan(username: str, password: str) -> tuple[bool, str
         msg = f"Airsonic returned HTTP {r.status_code}: {body}"
         logger.warning("trigger_airsonic_scan: %s", msg)
         return False, msg
-    ok = "status=\"ok\"" in r.text or '"status":"ok"' in r.text
+    body = r.text or ""
+    ok = False
+    # JSON response (common when f=json is honored)
+    try:
+        parsed = r.json()
+        status = (parsed.get("subsonic-response") or {}).get("status")
+        ok = (status == "ok")
+    except Exception:
+        # XML/other response fallback
+        if re.search(r'status\s*=\s*"ok"', body, flags=re.IGNORECASE):
+            ok = True
+        elif re.search(r'"status"\s*:\s*"ok"', body, flags=re.IGNORECASE):
+            ok = True
     if not ok:
-        msg = f"Airsonic scan response indicated failure: {(r.text or '')[:200]}"
+        msg = f"Airsonic scan response indicated failure: {body[:200]}"
         logger.warning("trigger_airsonic_scan: %s", msg)
         return False, msg
     return True, "Scan triggered."
+
+
+def _run_rip_job(job_id: str, username: str, password: str) -> None:
+    with RIP_JOBS_LOCK:
+        job = RIP_JOBS.get(job_id)
+    if not job:
+        return
+    req = job.request
+    artist = str(req.get("artist") or "").strip()
+    album = str(req.get("album") or "").strip()
+    url = str(req.get("url") or "").strip()
+    year = req.get("year")
+
+    _update_job(job_id, status="running", step="Starting rip job", percent=0.0, log_line="Starting rip job")
+    progress_log: list[str] = []
+
+    def _progress(percent: float, step: str) -> None:
+        _update_job(job_id, status="running", step=step, percent=percent, log_line=f"[{percent:.1f}%] {step}")
+
+    try:
+        result = _rip_youtube_sync(url, artist, album, year, progress_log, _progress)
+        rip_id = _youtube_url_to_id(url)
+        if rip_id:
+            _add_ripped_youtube_id(rip_id)
+        scan_ok, scan_msg = False, "Scan not attempted."
+        if TRIGGER_AIRSONIC_SCAN:
+            try:
+                scan_ok, scan_msg = asyncio.run(trigger_airsonic_scan(username, password))
+            except Exception as e:
+                scan_ok = False
+                scan_msg = f"Scan trigger failed: {e}"
+        result["airsonic_scan_triggered"] = scan_ok
+        result["airsonic_scan_message"] = scan_msg
+        _update_job(
+            job_id,
+            status="completed",
+            step="Rip completed",
+            percent=100.0,
+            log_line=f"Rip completed. {result.get('tracks_added', 0)} track(s) saved to {result.get('output_dir', '-')}.",
+            result=result,
+        )
+    except Exception as e:
+        friendly = _friendly_ytdlp_error(e)
+        _update_job(job_id, status="failed", step="Rip failed", percent=100.0, error=friendly, log_line=f"Rip failed: {friendly}")
+
 # --- qBittorrent ---
 def add_magnet_to_qbit(magnet: str) -> None:
     host, _, port = QBIT_HOST.partition(":")
@@ -931,31 +1219,39 @@ async def rip_youtube(req: RipYouTubeRequest, auth: tuple[str, str] = Depends(ge
         raise HTTPException(status_code=400, detail="Artist is required")
     if not album:
         raise HTTPException(status_code=400, detail="Album is required")
-    progress_log: list[str] = []
     try:
-        result = await asyncio.to_thread(_rip_youtube_sync, req.url, artist, album, req.year, progress_log)
+        normalized = _normalize_youtube_url(req.url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"YouTube rip failed: {_friendly_ytdlp_error(e)}")
 
-    rip_id = _youtube_url_to_id(req.url)
-    if rip_id:
-        _add_ripped_youtube_id(rip_id)
+    job_id = uuid4().hex
+    job = RipJob(
+        id=job_id,
+        requested_by=auth[0],
+        request={
+            "url": normalized,
+            "artist": artist,
+            "album": album,
+            "year": (req.year or "").strip()[:4] or None,
+        },
+        status="queued",
+        step="Queued",
+        progress_percent=0.0,
+        log=["Queued rip job"],
+    )
+    with RIP_JOBS_LOCK:
+        RIP_JOBS[job_id] = job
+        _cleanup_old_jobs()
 
-    scan_ok, scan_msg = False, "Scan not attempted."
-    if TRIGGER_AIRSONIC_SCAN:
-        scan_ok, scan_msg = await trigger_airsonic_scan(auth[0], auth[1])
+    worker = threading.Thread(target=_run_rip_job, args=(job_id, auth[0], auth[1]), daemon=True)
+    worker.start()
+    return {"ok": True, "job_id": job_id, "status": "queued"}
 
-    return {
-        "ok": True,
-        "tracks_added": result["tracks_added"],
-        "output_dir": result["output_dir"],
-        "tracks": result["tracks"],
-        "airsonic_scan_triggered": scan_ok,
-        "airsonic_scan_message": scan_msg,
-        "log": progress_log,
-    }
+
+@app.get("/api/rip-youtube/jobs/{job_id}")
+async def rip_youtube_job(job_id: str, auth: tuple[str, str] = Depends(get_auth_header)):
+    job = _get_job_for_user(job_id, auth[0])
+    return _job_snapshot(job)
 
 
 @app.post("/api/add-torrent")

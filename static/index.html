@@ -47,6 +47,9 @@
     .source-label { font-size: 0.85rem; color: #888; margin-right: 0.25rem; }
     .hint { font-size: 0.85rem; color: #888; margin: 0.5rem 0 0.75rem; }
     .status-line { margin-top: 0.75rem; }
+    .progress-wrap { margin-top: 0.5rem; }
+    .progress-wrap progress { width: 100%; height: 0.8rem; }
+    .progress-text { font-size: 0.8rem; color: #aaa; margin-top: 0.35rem; }
   
     .status-log { font-size: 0.8rem; color: #888; background: #0f0f1a; padding: 0.75rem; border-radius: 6px; margin-top: 0.5rem; white-space: pre-wrap; max-height: 12rem; overflow-y: auto; }
 </style>
@@ -126,6 +129,10 @@
         <p id="album-yt-artist-match" class="hint hidden"></p>
         <p id="album-yt-loading" class="hidden">Searching YouTube...</p>
         <div id="album-yt-results"></div>
+        <div id="album-yt-progress-wrap" class="progress-wrap hidden">
+          <progress id="album-yt-progress" value="0" max="100"></progress>
+          <div id="album-yt-progress-text" class="progress-text">0%</div>
+        </div>
         <p id="album-yt-status" class="success status-line hidden"></p>
         <pre id="album-yt-log" class="status-log hidden"></pre>
       </div>
@@ -140,6 +147,7 @@
     let creds = null;
     let currentArtist = null;
     let albumSearchSource = 'torrent';
+    let ripPollTimer = null;
 
     function b64(s) { return btoa(unescape(encodeURIComponent(s))); }
     function authHeader() {
@@ -148,6 +156,12 @@
     }
     function api(url, opts = {}) {
       return fetch(url, { ...opts, headers: { 'Content-Type': 'application/json', ...authHeader(), ...opts.headers } });
+    }
+    async function parseApiResponse(r) {
+      const ct = (r.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('application/json')) return await r.json();
+      const txt = await r.text();
+      return { detail: (txt || '').trim() || ('HTTP ' + r.status) };
     }
     function show(el, on) { el.classList.toggle('hidden', !on); }
     function err(el, msg) { el.textContent = msg || ''; show(el, !!msg); }
@@ -160,6 +174,23 @@
       return (n / k).toFixed(1) + ' KB';
     }
 
+    function stopRipPolling() {
+      if (ripPollTimer) {
+        clearTimeout(ripPollTimer);
+        ripPollTimer = null;
+      }
+    }
+
+    function updateRipProgress(percent, text) {
+      const wrap = document.getElementById('album-yt-progress-wrap');
+      const bar = document.getElementById('album-yt-progress');
+      const label = document.getElementById('album-yt-progress-text');
+      const pct = Math.max(0, Math.min(Number(percent || 0), 100));
+      bar.value = pct;
+      label.textContent = pct.toFixed(1) + '% — ' + (text || 'Working...');
+      show(wrap, true);
+    }
+
     function setAlbumSource(source) {
       albumSearchSource = source === 'youtube' ? 'youtube' : 'torrent';
       document.getElementById('btn-source-torrent').className = albumSearchSource === 'torrent' ? '' : 'btn-secondary';
@@ -167,12 +198,17 @@
     }
 
     function clearAlbumResults() {
+      stopRipPolling();
       document.getElementById('album-tpb-results').innerHTML = '';
       document.getElementById('album-yt-results').innerHTML = '';
       err(document.getElementById('album-yt-artist-match'));
       err(document.getElementById('album-yt-status'));
       show(document.getElementById('album-tpb-loading'), false);
       show(document.getElementById('album-yt-loading'), false);
+      show(document.getElementById('album-yt-progress-wrap'), false);
+      document.getElementById('album-yt-progress').value = 0;
+      document.getElementById('album-yt-progress-text').textContent = '0%';
+      document.getElementById('album-yt-log').textContent = '';
       show(document.getElementById('album-tpb-flow'), false);
       show(document.getElementById('album-yt-flow'), false);
     }
@@ -239,14 +275,10 @@
         const duration = v.duration_human || '-';
         const alreadyRipped = !!v.already_ripped;
         const ytUrl = (v.url || '').replace(/"/g, '&quot;');
-        row.innerHTML = '<div><a class="name yt-result-link" href="' + ytUrl + '" target="_blank" rel="noopener noreferrer" title="Open in YouTube">' + escapeHtml(v.title || 'Untitled') + '</a><div class="meta"><span>' + escapeHtml(v.channel || 'Unknown channel') + '</span><span>' + escapeHtml(duration) + '</span></div></div><button>' + (alreadyRipped ? 'Ripped' : 'Rip') + '</button>';
+        row.innerHTML = '<div><a class="name yt-result-link" href="' + ytUrl + '" target="_blank" rel="noopener noreferrer" title="Open in YouTube">' + escapeHtml(v.title || 'Untitled') + '</a><div class="meta"><span>' + escapeHtml(v.channel || 'Unknown channel') + '</span><span>' + escapeHtml(duration) + '</span></div></div><button>' + (alreadyRipped ? 'Re-rip' : 'Rip') + '</button>';
         const btn = row.querySelector('button');
-        if (alreadyRipped) {
-          btn.className = 'added';
-          btn.disabled = true;
-        } else {
-          btn.onclick = () => ripYouTubeResult(v, album, btn);
-        }
+        if (alreadyRipped) btn.className = 'btn-secondary';
+        btn.onclick = () => ripYouTubeResult(v, album, btn);
         containerEl.appendChild(row);
       });
     }
@@ -444,6 +476,7 @@
       err(document.getElementById('album-yt-status'));
       err(artistMatchEl);
       show(document.getElementById('album-yt-log'), false);
+      show(document.getElementById('album-yt-progress-wrap'), false);
       resEl.innerHTML = '';
       show(loadEl, true);
       try {
@@ -453,7 +486,7 @@
           + '&artist=' + encodeURIComponent(currentArtist.name)
           + '&album=' + encodeURIComponent(album.title);
         const r = await api(url);
-        const body = await r.json();
+        const body = await parseApiResponse(r);
         if (!r.ok) throw new Error(body.detail || 'Search failed');
         show(loadEl, false);
         if (body.matched_artist && body.matched_artist.channel_url) {
@@ -467,14 +500,63 @@
       }
     }
 
+    async function pollRipJob(jobId, btn) {
+      const statusEl = document.getElementById('album-yt-status');
+      const logEl = document.getElementById('album-yt-log');
+      stopRipPolling();
+      const tick = async () => {
+        try {
+          const r = await api('/api/rip-youtube/jobs/' + encodeURIComponent(jobId));
+          const body = await parseApiResponse(r);
+          if (!r.ok) throw new Error(body.detail || 'Failed to read rip job status');
+
+          updateRipProgress(body.progress_percent || 0, body.step || 'Working...');
+          if (body.log && body.log.length) {
+            logEl.textContent = body.log.join('\n');
+            show(logEl, true);
+          }
+
+          if (body.status === 'completed') {
+            const result = body.result || {};
+            const verify = result.verification || {};
+            const scanMsg = result.airsonic_scan_message || (result.airsonic_scan_triggered ? 'Airsonic scan triggered.' : 'Airsonic scan was not triggered.');
+            const verifyMsg = 'Metadata OK: ' + (verify.all_metadata_ok ? 'yes' : 'no')
+              + '; Cover embedded on all tracks: ' + (verify.all_cover_embedded ? 'yes' : 'no');
+            err(statusEl, 'Ripped ' + (result.tracks_added || 0) + '/' + (result.expected_tracks || result.tracks_added || 0) + ' track(s) to ' + (result.output_dir || '-') + '. ' + verifyMsg + '. ' + scanMsg);
+            statusEl.classList.remove('error');
+            statusEl.classList.add('success');
+            btn.textContent = 'Ripped';
+            btn.className = 'btn-secondary';
+            btn.disabled = false;
+            stopRipPolling();
+            return;
+          }
+          if (body.status === 'failed') {
+            throw new Error(body.error || 'Rip failed');
+          }
+          ripPollTimer = setTimeout(tick, 1000);
+        } catch (e) {
+          err(statusEl, e.message || 'Rip failed');
+          statusEl.classList.remove('success');
+          statusEl.classList.add('error');
+          btn.disabled = false;
+          btn.textContent = 'Rip';
+          stopRipPolling();
+        }
+      };
+      await tick();
+    }
+
     async function ripYouTubeResult(video, album, btn) {
       const statusEl = document.getElementById('album-yt-status');
       const logEl = document.getElementById('album-yt-log');
       const prevLabel = btn.textContent;
+      stopRipPolling();
       btn.disabled = true;
-      btn.textContent = 'Ripping...';
+      btn.textContent = 'Starting...';
       err(statusEl, '');
       show(logEl, false);
+      updateRipProgress(0, 'Queueing rip job');
       try {
         const payload = {
           url: video.url || video.id,
@@ -483,26 +565,21 @@
           year: album.date || null
         };
         const r = await api('/api/rip-youtube', { method: 'POST', body: JSON.stringify(payload) });
-        const body = await r.json();
+        const body = await parseApiResponse(r);
         if (!r.ok) throw new Error(body.detail || 'Rip failed');
-        const scanMsg = body.airsonic_scan_message != null ? body.airsonic_scan_message : (body.airsonic_scan_triggered ? 'Airsonic scan triggered.' : 'Album saved. Airsonic scan was not triggered (or was not permitted).');
-        err(statusEl, 'Ripped ' + body.tracks_added + ' track(s) to ' + body.output_dir + '. ' + scanMsg);
+        if (!body.job_id) throw new Error('Rip job did not return a job ID');
+        err(statusEl, 'Rip job started. Waiting for live progress updates...');
         statusEl.classList.remove('error');
         statusEl.classList.add('success');
-        if (body.log && body.log.length) {
-          logEl.textContent = body.log.join('\n');
-          show(logEl, true);
-        }
-        btn.textContent = 'Ripped';
-        btn.className = 'added';
-        btn.disabled = true;
-        btn.onclick = null;
+        btn.textContent = 'Ripping...';
+        await pollRipJob(body.job_id, btn);
       } catch (e) {
         err(statusEl, e.message || 'Rip failed');
         statusEl.classList.remove('success');
         statusEl.classList.add('error');
         btn.disabled = false;
         btn.textContent = prevLabel;
+        stopRipPolling();
       }
     }
 

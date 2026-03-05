@@ -123,6 +123,7 @@
           <button id="yt-search-mode-album">Albums &amp; playlists</button>
           <button id="yt-search-mode-song" class="btn-secondary">Single songs</button>
         </div>
+        <p id="album-yt-artist-match" class="hint hidden"></p>
         <p id="album-yt-loading" class="hidden">Searching YouTube...</p>
         <div id="album-yt-results"></div>
         <p id="album-yt-status" class="success status-line hidden"></p>
@@ -168,6 +169,7 @@
     function clearAlbumResults() {
       document.getElementById('album-tpb-results').innerHTML = '';
       document.getElementById('album-yt-results').innerHTML = '';
+      err(document.getElementById('album-yt-artist-match'));
       err(document.getElementById('album-yt-status'));
       show(document.getElementById('album-tpb-loading'), false);
       show(document.getElementById('album-yt-loading'), false);
@@ -438,16 +440,26 @@
       show(document.getElementById('album-tpb-flow'), false);
       const resEl = document.getElementById('album-yt-results');
       const loadEl = document.getElementById('album-yt-loading');
+      const artistMatchEl = document.getElementById('album-yt-artist-match');
       err(document.getElementById('album-yt-status'));
+      err(artistMatchEl);
       show(document.getElementById('album-yt-log'), false);
       resEl.innerHTML = '';
       show(loadEl, true);
       try {
         const q = ytSearchMode === 'album' ? (currentArtist.name + ' ' + album.title + ' full album') : (currentArtist.name + ' ' + album.title);
-        const r = await api('/api/search-youtube?q=' + encodeURIComponent(q) + '&mode=' + encodeURIComponent(ytSearchMode));
+        const url = '/api/search-youtube?q=' + encodeURIComponent(q)
+          + '&mode=' + encodeURIComponent(ytSearchMode)
+          + '&artist=' + encodeURIComponent(currentArtist.name)
+          + '&album=' + encodeURIComponent(album.title);
+        const r = await api(url);
         const body = await r.json();
         if (!r.ok) throw new Error(body.detail || 'Search failed');
         show(loadEl, false);
+        if (body.matched_artist && body.matched_artist.channel_url) {
+          artistMatchEl.innerHTML = 'Matched artist on YouTube Music: <a href="' + body.matched_artist.channel_url.replace(/"/g, '&quot;') + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(body.matched_artist.name || body.matched_artist.channel_url) + '</a>';
+          show(artistMatchEl, true);
+        }
         renderYouTubeResults(body.results || [], resEl, album);
       } catch (e) {
         show(loadEl, false);

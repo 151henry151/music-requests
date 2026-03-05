@@ -11,7 +11,7 @@ A Jellyseerr-style web app for Airsonic/Subsonic users to request music. Search 
 - **TPB search** — Search The Pirate Bay via Apibay (no API key required)
 - **Smart filtering** — Zero-seeder torrents hidden by default with an option to reveal
 - **qBittorrent integration** — Add magnets directly with category `lidarr` for Lidarr import
-- **YouTube album search** — Search YouTube directly for album candidates
+- **YouTube album search** — Resolve the matched YouTube Music artist and list release playlists for album requests
 - **YouTube ripping** — Rip audio tracks from YouTube videos/playlists with embedded metadata and cover art
 
 ## Flow
@@ -21,7 +21,7 @@ A Jellyseerr-style web app for Airsonic/Subsonic users to request music. Search 
 3. Choose **Album** (pick one) or **Discography** (full collection)
 4. For albums, choose source:
    - **Torrent**: search TPB and add a magnet to qBittorrent
-   - **YouTube**: search YouTube and click **Rip** to import directly
+   - **YouTube**: match the artist on YouTube Music, show release playlists, and click **Rip** to import directly
 5. If torrent search returns no album results, click **Search YouTube for this album** as fallback
 6. YouTube rips are written to `YT_IMPORT_DIR` as tagged MP3 files with embedded cover art
 
@@ -122,7 +122,7 @@ server {
 
 - **Backend:** Python, FastAPI
 - **Frontend:** Vanilla HTML/CSS/JS
-- **APIs:** MusicBrainz, Deezer, Apibay (TPB), YouTube (yt-dlp), Subsonic
+- **APIs:** MusicBrainz, Deezer, Apibay (TPB), YouTube (yt-dlp), YouTube Music (ytmusicapi), Subsonic
 - **Auth:** Basic Auth (credentials verified via Subsonic `ping.view`)
 
 ## Development

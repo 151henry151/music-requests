@@ -22,3 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Install ffmpeg in the Docker image to support YouTube audio extraction and chapter splitting.
 - Extend README with YouTube workflow, configuration, and import-path setup.
+- Route album-mode YouTube search through YouTube Music artist matching instead of generic yt-dlp video search.
+- Return artist release playlists from the matched YouTube Music artist channel for album-mode search results.
+- Add matched-artist channel context to the YouTube results UI and pass artist/album hints to `/api/search-youtube`.
+- Add `ytmusicapi` to runtime dependencies for artist and release resolution.

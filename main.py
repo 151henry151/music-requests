@@ -14,6 +14,8 @@ the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 """
 import asyncio
+import json
+import logging
 import os
 import re
 import shutil
@@ -35,6 +37,7 @@ from mutagen.easyid3 import EasyID3
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError
 from mutagen.mp3 import MP3
 from pydantic import BaseModel
+from ytmusicapi import YTMusic
 
 
 def _env_int(name: str, default: int) -> int:
@@ -61,6 +64,10 @@ YT_RIPPED_IDS_FILE = os.environ.get("YT_RIPPED_IDS_FILE", str(Path(YT_IMPORT_DIR
 YT_AUDIO_QUALITY = (os.environ.get("YT_AUDIO_QUALITY", "192").strip().lower().removesuffix("k") or "192")
 YT_DLP_COOKIES_FILE = os.environ.get("YT_DLP_COOKIES_FILE", "").strip()
 TRIGGER_AIRSONIC_SCAN = os.environ.get("TRIGGER_AIRSONIC_SCAN", "true").strip().lower() in ("1", "true", "yes")
+
+logger = logging.getLogger("music_requests")
+YT_MUSIC_BASE = "https://music.youtube.com"
+_ytmusic_client: YTMusic | None = None
 
 
 # --- Models ---
@@ -335,6 +342,128 @@ def _yt_dlp_common_opts() -> dict:
         if cookie_path.exists():
             opts["cookiefile"] = str(cookie_path)
     return opts
+
+
+def _get_ytmusic_client() -> YTMusic:
+    global _ytmusic_client
+    if _ytmusic_client is None:
+        _ytmusic_client = YTMusic()
+    return _ytmusic_client
+
+
+def _norm_lookup(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", (value or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _ytmusic_find_artist(artist_name: str) -> dict | None:
+    yt = _get_ytmusic_client()
+    results = yt.search(artist_name, filter="artists", limit=20) or []
+    if not results:
+        return None
+    target = _norm_lookup(artist_name)
+    exact = [
+        a for a in results
+        if _norm_lookup((a.get("artist") or a.get("title") or "")) == target
+    ]
+    preferred = exact or results
+    artist = preferred[0]
+    browse_id = artist.get("browseId")
+    if not browse_id:
+        return None
+    display_name = (artist.get("artist") or artist.get("title") or artist_name).strip()
+    channel_url = f"{YT_MUSIC_BASE}/channel/{browse_id}" if browse_id.startswith("UC") else ""
+    thumb = None
+    thumbs = artist.get("thumbnails") or []
+    if thumbs:
+        thumb = thumbs[-1].get("url") or thumbs[0].get("url")
+    return {
+        "name": display_name,
+        "browse_id": browse_id,
+        "channel_url": channel_url,
+        "thumbnail": thumb,
+    }
+
+
+def _total_duration_from_tracks(tracks: list[dict]) -> int:
+    total = 0
+    for t in tracks:
+        sec = t.get("duration_seconds")
+        if isinstance(sec, int):
+            total += sec
+    return total
+
+
+def _youtube_album_results_via_ytmusic(artist_name: str, album_hint: str | None, limit: int) -> tuple[list[dict], dict | None]:
+    artist_match = _ytmusic_find_artist(artist_name)
+    if not artist_match:
+        return [], None
+    yt = _get_ytmusic_client()
+    details = yt.get_artist(artist_match["browse_id"])
+    sections = []
+    for key in ("albums", "singles"):
+        sec = details.get(key) or {}
+        sections.extend(sec.get("results") or [])
+
+    seen_playlists: set[str] = set()
+    results: list[dict] = []
+    target_artist_norm = _norm_lookup(artist_match["name"])
+    hint_norm = _norm_lookup(album_hint or "")
+
+    for item in sections:
+        browse_id = item.get("browseId")
+        if not browse_id:
+            continue
+        try:
+            album = yt.get_album(browse_id)
+        except Exception:
+            continue
+        playlist_id = album.get("audioPlaylistId") or item.get("playlistId")
+        if not playlist_id or playlist_id in seen_playlists:
+            continue
+        album_title = (album.get("title") or item.get("title") or "").strip()
+        artists = album.get("artists") or item.get("artists") or []
+        artist_names = [a.get("name", "") for a in artists]
+        # Keep only releases clearly tied to the matched artist.
+        if artist_names and all(_norm_lookup(n) != target_artist_norm for n in artist_names):
+            continue
+
+        tracks = album.get("tracks") or []
+        duration_sec = _total_duration_from_tracks(tracks)
+        url = f"{YT_MUSIC_BASE}/playlist?list={playlist_id}"
+        thumbs = album.get("thumbnails") or item.get("thumbnails") or []
+        thumbnail = thumbs[-1].get("url") if thumbs else None
+        year = str(album.get("year") or item.get("year") or "")
+        if year == "None":
+            year = ""
+        score = 1
+        title_norm = _norm_lookup(album_title)
+        if hint_norm:
+            if title_norm == hint_norm:
+                score = 4
+            elif hint_norm in title_norm or title_norm in hint_norm:
+                score = 3
+            elif any(tok in title_norm for tok in hint_norm.split(" ")):
+                score = 2
+        results.append({
+            "id": f"playlist_{playlist_id}",
+            "title": album_title or "Unknown album",
+            "channel": artist_match["name"],
+            "duration": duration_sec,
+            "duration_human": _fmt_duration(duration_sec),
+            "url": url,
+            "thumbnail": thumbnail,
+            "year": year,
+            "score": score,
+            "artist_channel_url": artist_match["channel_url"],
+        })
+        seen_playlists.add(playlist_id)
+
+    results.sort(key=lambda x: (x.get("score", 1), x.get("year") or "", x.get("title") or ""), reverse=True)
+    trimmed = results[:limit]
+    for r in trimmed:
+        r.pop("score", None)
+    return trimmed, artist_match
 
 
 def _youtube_search_sync(query: str, limit: int, mode: str = "album") -> list[dict]:
@@ -639,8 +768,8 @@ async def trigger_airsonic_scan(username: str, password: str) -> tuple[bool, str
     if r.status_code != 200:
         body = (r.text or "")[:200]
         msg = f"Airsonic returned HTTP {r.status_code}: {body}"
-        return False, msg
         logger.warning("trigger_airsonic_scan: %s", msg)
+        return False, msg
     ok = "status=\"ok\"" in r.text or '"status":"ok"' in r.text
     if not ok:
         msg = f"Airsonic scan response indicated failure: {(r.text or '')[:200]}"
@@ -761,6 +890,8 @@ async def search_youtube_api(
     q: str,
     limit: int | None = None,
     mode: str = "album",
+    artist: str | None = None,
+    album: str | None = None,
     _: tuple = Depends(get_auth_header),
 ):
     """Search YouTube. mode=album prefers full albums (long first); mode=song prefers single tracks."""
@@ -769,15 +900,27 @@ async def search_youtube_api(
     use_limit = limit if limit is not None else YT_SEARCH_LIMIT
     use_limit = max(1, min(use_limit, 25))
     search_mode = "album" if (mode or "").strip().lower() == "album" else "song"
+    matched_artist = None
     try:
-        results = await youtube_search(q.strip(), use_limit, search_mode)
+        if search_mode == "album" and artist and artist.strip():
+            results, matched_artist = await asyncio.to_thread(
+                _youtube_album_results_via_ytmusic,
+                artist.strip(),
+                (album or "").strip(),
+                use_limit,
+            )
+            if not results:
+                # Fall back to generic yt-dlp search if YT Music artist albums could not be resolved.
+                results = await youtube_search(q.strip(), use_limit, search_mode)
+        else:
+            results = await youtube_search(q.strip(), use_limit, search_mode)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"YouTube search failed: {_friendly_ytdlp_error(e)}")
     ripped_ids = _get_ripped_youtube_ids()
     for r in results:
         vid = r.get("id") or _youtube_url_to_id(r.get("url") or "")
         r["already_ripped"] = bool(vid and vid in ripped_ids)
-    return {"results": results}
+    return {"results": results, "matched_artist": matched_artist}
 
 
 @app.post("/api/rip-youtube")

@@ -36,6 +36,8 @@
     .torrent-row { padding: 0.75rem; border-bottom: 1px solid #222; display: grid; grid-template-columns: 1fr auto; gap: 0.5rem; align-items: center; }
     .torrent-row:hover { background: #1f2d4a; }
     .torrent-row .name { font-weight: 500; }
+    .yt-result-link { color: inherit; text-decoration: none; }
+    .yt-result-link:hover { color: #4cc9f0; text-decoration: underline; }
     .torrent-row .meta { font-size: 0.8rem; color: #888; }
     .torrent-row button { padding: 0.4rem 0.8rem; font-size: 0.85rem; }
     #login-form { max-width: 320px; }
@@ -234,7 +236,8 @@
         row.className = 'torrent-row';
         const duration = v.duration_human || '-';
         const alreadyRipped = !!v.already_ripped;
-        row.innerHTML = '<div><div class="name">' + escapeHtml(v.title || 'Untitled') + '</div><div class="meta"><span>' + escapeHtml(v.channel || 'Unknown channel') + '</span><span>' + escapeHtml(duration) + '</span></div></div><button>' + (alreadyRipped ? 'Ripped' : 'Rip') + '</button>';
+        const ytUrl = (v.url || '').replace(/"/g, '&quot;');
+        row.innerHTML = '<div><a class="name yt-result-link" href="' + ytUrl + '" target="_blank" rel="noopener noreferrer" title="Open in YouTube">' + escapeHtml(v.title || 'Untitled') + '</a><div class="meta"><span>' + escapeHtml(v.channel || 'Unknown channel') + '</span><span>' + escapeHtml(duration) + '</span></div></div><button>' + (alreadyRipped ? 'Ripped' : 'Rip') + '</button>';
         const btn = row.querySelector('button');
         if (alreadyRipped) {
           btn.className = 'added';

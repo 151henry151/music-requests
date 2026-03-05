@@ -362,8 +362,10 @@ def _youtube_search_sync(query: str, limit: int, mode: str = "album") -> list[di
             "url": url,
             "thumbnail": e.get("thumbnail"),
         })
-    # album mode: prefer full albums (long duration first); song mode: single tracks first
+    # album mode: only show longer content (full albums/playlists), then sort long first
+    MIN_ALBUM_DURATION_SEC = 600  # 10 min; single songs are typically 2-5 min
     if mode == "album":
+        out = [x for x in out if (x.get("duration") or 0) >= MIN_ALBUM_DURATION_SEC]
         out.sort(key=lambda x: (x.get("duration") or 0), reverse=True)
     else:
         out.sort(key=lambda x: (x.get("duration") or 0))

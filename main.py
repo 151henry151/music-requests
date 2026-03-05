@@ -5,6 +5,7 @@ Music Request App - Jellyseerr-like flow for Airsonic users.
 - Album list via MusicBrainz
 - TPB search via Apibay
 - Add magnet to qBittorrent (category: lidarr)
+- YouTube search + rip to tagged MP3 files
 
 Copyright (C) 2026  Music Request contributors
 This program is free software: you can redistribute it and/or modify
@@ -14,15 +15,34 @@ the Free Software Foundation, either version 3 of the License, or
 """
 import asyncio
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import urllib.parse
 from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 import httpx
 import qbittorrentapi
+import yt_dlp
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import APIC, ID3, ID3NoHeaderError
+from mutagen.mp3 import MP3
 from pydantic import BaseModel
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
 
 # Config from env
 AIRSONIC_URL = os.environ.get("AIRSONIC_URL", "https://music.romptele.com").rstrip("/")
@@ -35,6 +55,11 @@ MUSICBRAINZ_BASE = "https://musicbrainz.org/ws/2"
 APIBAY_BASE = "https://apibay.org"
 DEEZER_BASE = "https://api.deezer.com"
 USER_AGENT = "MusicRequests/1.0 (https://music-requests.romptele.com)"
+YT_IMPORT_DIR = os.environ.get("YT_IMPORT_DIR", "/tmp/music-requests-imports")
+YT_SEARCH_LIMIT = max(_env_int("YT_SEARCH_LIMIT", 8), 1)
+YT_AUDIO_QUALITY = (os.environ.get("YT_AUDIO_QUALITY", "192").strip().lower().removesuffix("k") or "192")
+YT_DLP_COOKIES_FILE = os.environ.get("YT_DLP_COOKIES_FILE", "").strip()
+TRIGGER_AIRSONIC_SCAN = os.environ.get("TRIGGER_AIRSONIC_SCAN", "true").strip().lower() in ("1", "true", "yes")
 
 
 # --- Models ---
@@ -45,6 +70,13 @@ class LoginRequest(BaseModel):
 
 class AddTorrentRequest(BaseModel):
     magnet: str
+
+
+class RipYouTubeRequest(BaseModel):
+    url: str
+    artist: str
+    album: str
+    year: str | None = None
 
 
 # --- Auth: verify Airsonic credentials via Subsonic ping ---
@@ -198,6 +230,354 @@ def info_hash_to_magnet(info_hash: str, name: str) -> str:
     return f"magnet:?xt=urn:btih:{info_hash}&dn={dn}"
 
 
+def _safe_path_component(name: str, fallback: str = "Unknown") -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", (name or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().strip(".")
+    if not cleaned:
+        return fallback
+    return cleaned[:120]
+
+
+def _fmt_duration(seconds: int | None) -> str:
+    if not seconds:
+        return "-"
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _normalize_youtube_url(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("YouTube URL is required")
+    # Allow clients to pass either an ID or a full URL.
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
+        return f"https://www.youtube.com/watch?v={raw}"
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Invalid URL")
+    host = parsed.netloc.lower()
+    allowed_hosts = ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")
+    if host not in allowed_hosts:
+        raise ValueError("Only YouTube URLs are supported")
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            raise ValueError("Invalid YouTube video ID")
+        return f"https://www.youtube.com/watch?v={video_id}"
+    qs = parse_qs(parsed.query)
+    list_id = (qs.get("list") or [None])[0]
+    video_id = (qs.get("v") or [None])[0]
+    if list_id and not video_id:
+        return f"https://www.youtube.com/playlist?list={list_id}"
+    if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        return f"https://www.youtube.com/watch?v={video_id}"
+    raise ValueError("Invalid YouTube URL")
+
+
+def _yt_dlp_common_opts() -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "geo_bypass": True,
+    }
+    if YT_DLP_COOKIES_FILE:
+        cookie_path = Path(YT_DLP_COOKIES_FILE)
+        if cookie_path.exists():
+            opts["cookiefile"] = str(cookie_path)
+    return opts
+
+
+def _youtube_search_sync(query: str, limit: int) -> list[dict]:
+    opts = _yt_dlp_common_opts()
+    opts.update({
+        "skip_download": True,
+        # Flat extraction avoids expensive per-video metadata calls that
+        # frequently trigger YouTube anti-bot challenges.
+        "extract_flat": "in_playlist",
+        "noplaylist": True,
+    })
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+    entries = info.get("entries") or []
+    out = []
+    for e in entries:
+        if not e:
+            continue
+        video_id = e.get("id")
+        url = e.get("webpage_url") or (f"https://www.youtube.com/watch?v={video_id}" if video_id else "")
+        out.append({
+            "id": video_id,
+            "title": e.get("title", "Unknown title"),
+            "channel": e.get("channel") or e.get("uploader") or "",
+            "duration": e.get("duration") or 0,
+            "duration_human": _fmt_duration(e.get("duration") or 0),
+            "url": url,
+            "thumbnail": e.get("thumbnail"),
+        })
+    return out
+
+
+async def youtube_search(query: str, limit: int) -> list[dict]:
+    return await asyncio.to_thread(_youtube_search_sync, query, limit)
+
+
+def _run_ffmpeg(cmd: list[str]) -> None:
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", errors="ignore").strip() if e.stderr else ""
+        raise RuntimeError(stderr or "ffmpeg command failed")
+
+
+def _friendly_ytdlp_error(exc: Exception) -> str:
+    msg = str(exc)
+    lower = msg.lower()
+    if "not a bot" in lower or "sign in to confirm" in lower:
+        return (
+            f"{msg} "
+            "Set YT_DLP_COOKIES_FILE to a valid YouTube cookies export if this persists."
+        )
+    return msg
+
+
+def _collect_cover_urls(info: dict) -> list[str]:
+    urls: list[str] = []
+    thumb = info.get("thumbnail")
+    if thumb:
+        urls.append(thumb)
+    for t in info.get("thumbnails", []):
+        u = t.get("url")
+        if u and u not in urls:
+            urls.append(u)
+    return urls
+
+
+def _download_cover_jpg(urls: list[str], target_dir: Path) -> Path | None:
+    headers = {"User-Agent": USER_AGENT}
+    for idx, url in enumerate(urls):
+        try:
+            with httpx.Client(timeout=20.0, headers=headers, follow_redirects=True) as client:
+                r = client.get(url)
+                r.raise_for_status()
+            ext = Path(urlparse(url).path).suffix.lower() or ".jpg"
+            raw_path = target_dir / f"cover-{idx}{ext}"
+            raw_path.write_bytes(r.content)
+            if ext in (".jpg", ".jpeg"):
+                return raw_path
+            jpg_path = target_dir / f"cover-{idx}.jpg"
+            _run_ffmpeg([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(raw_path), str(jpg_path),
+            ])
+            if jpg_path.exists():
+                return jpg_path
+        except Exception:
+            continue
+    return None
+
+
+def _download_audio_sync(source_url: str, work_dir: Path, prefix: str) -> tuple[Path, dict]:
+    opts = _yt_dlp_common_opts()
+    opts.update({
+        "format": "bestaudio/best",
+        "outtmpl": str(work_dir / f"{prefix}-%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": YT_AUDIO_QUALITY},
+            {"key": "FFmpegMetadata"},
+        ],
+    })
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(source_url, download=True)
+
+    requested = info.get("requested_downloads") or []
+    for item in requested:
+        fp = item.get("filepath")
+        if not fp:
+            continue
+        p = Path(fp)
+        mp3_candidate = p.with_suffix(".mp3")
+        if mp3_candidate.exists():
+            return mp3_candidate, info
+        if p.exists():
+            return p, info
+
+    candidates = sorted(work_dir.glob(f"{prefix}-*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if candidates:
+        return candidates[0], info
+
+    raise RuntimeError("yt-dlp did not produce an audio file")
+
+
+def _tag_mp3(
+    file_path: Path,
+    *,
+    artist: str,
+    album: str,
+    title: str,
+    track_no: int,
+    total_tracks: int,
+    year: str | None,
+    cover_path: Path | None,
+) -> None:
+    try:
+        tags = EasyID3(str(file_path))
+    except ID3NoHeaderError:
+        audio = MP3(str(file_path))
+        audio.add_tags()
+        audio.save()
+        tags = EasyID3(str(file_path))
+
+    tags["title"] = [title]
+    tags["artist"] = [artist]
+    tags["album"] = [album]
+    tags["tracknumber"] = [f"{track_no}/{total_tracks}"]
+    if year:
+        tags["date"] = [year]
+    tags.save(v2_version=3)
+
+    if cover_path and cover_path.exists():
+        mime = "image/png" if cover_path.suffix.lower() == ".png" else "image/jpeg"
+        image_data = cover_path.read_bytes()
+        try:
+            id3 = ID3(str(file_path))
+        except ID3NoHeaderError:
+            id3 = ID3()
+        id3.delall("APIC")
+        id3.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=image_data))
+        id3.save(str(file_path), v2_version=3)
+
+
+def _split_by_chapters(source_mp3: Path, chapters: list[dict], out_dir: Path) -> list[tuple[Path, str]]:
+    out: list[tuple[Path, str]] = []
+    for idx, chapter in enumerate(chapters, start=1):
+        start = float(chapter.get("start_time") or 0.0)
+        end = float(chapter.get("end_time") or 0.0)
+        if end <= start:
+            continue
+        title = str(chapter.get("title") or f"Track {idx}").strip()
+        target = out_dir / f"chapter-{idx:03d}-{uuid4().hex[:8]}.mp3"
+        _run_ffmpeg([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+            "-i", str(source_mp3),
+            "-vn", "-c:a", "libmp3lame", "-b:a", f"{YT_AUDIO_QUALITY}k",
+            str(target),
+        ])
+        out.append((target, title))
+    return out
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    i = 2
+    while True:
+        candidate = path.with_name(f"{path.stem} ({i}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None) -> dict:
+    source_url = _normalize_youtube_url(url)
+    import_root = Path(YT_IMPORT_DIR)
+    import_root.mkdir(parents=True, exist_ok=True)
+
+    safe_artist = _safe_path_component(artist, "Unknown Artist")
+    safe_album = _safe_path_component(album, "Unknown Album")
+    clean_year = (year or "").strip()[:4]
+    album_dir_name = f"{safe_album} ({clean_year})" if clean_year else safe_album
+    album_dir = import_root / safe_artist / album_dir_name
+    album_dir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="yt-rip-", dir=str(import_root)) as tmp:
+        tmp_dir = Path(tmp)
+        info_opts = _yt_dlp_common_opts()
+        info_opts.update({"skip_download": True})
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
+            info = ydl.extract_info(source_url, download=False)
+
+        cover_path = _download_cover_jpg(_collect_cover_urls(info), tmp_dir)
+        final_cover: Path | None = None
+        if cover_path:
+            final_cover = album_dir / "cover.jpg"
+            shutil.copy2(cover_path, final_cover)
+            folder_cover = album_dir / "folder.jpg"
+            if not folder_cover.exists():
+                shutil.copy2(cover_path, folder_cover)
+
+        track_sources: list[tuple[Path, str]] = []
+        if info.get("_type") == "playlist" and info.get("entries"):
+            entries = [e for e in info.get("entries", []) if e]
+            for idx, entry in enumerate(entries, start=1):
+                entry_url = entry.get("webpage_url") or entry.get("url") or ""
+                if entry_url and not str(entry_url).startswith("http"):
+                    entry_id = entry.get("id")
+                    entry_url = f"https://www.youtube.com/watch?v={entry_id}" if entry_id else ""
+                if not entry_url:
+                    continue
+                audio_path, entry_info = _download_audio_sync(str(entry_url), tmp_dir, f"track-{idx:03d}")
+                title = (entry.get("title") or entry_info.get("title") or f"Track {idx}").strip()
+                track_sources.append((audio_path, title))
+        else:
+            audio_path, downloaded_info = _download_audio_sync(source_url, tmp_dir, "album")
+            chapters = downloaded_info.get("chapters") or info.get("chapters") or []
+            usable_chapters = [
+                c for c in chapters
+                if float(c.get("end_time") or 0.0) > float(c.get("start_time") or 0.0) and c.get("title")
+            ]
+            if len(usable_chapters) >= 2:
+                track_sources = _split_by_chapters(audio_path, usable_chapters, tmp_dir)
+            else:
+                title = (downloaded_info.get("title") or info.get("title") or album).strip()
+                track_sources = [(audio_path, title)]
+
+        if not track_sources:
+            raise RuntimeError("No tracks were produced from the YouTube source")
+
+        total_tracks = len(track_sources)
+        saved_files: list[str] = []
+        for idx, (source_file, title) in enumerate(track_sources, start=1):
+            safe_title = _safe_path_component(title, f"Track {idx}")
+            final_path = _unique_path(album_dir / f"{idx:02d} - {safe_title}.mp3")
+            shutil.move(str(source_file), str(final_path))
+            _tag_mp3(
+                final_path,
+                artist=artist.strip() or safe_artist,
+                album=album.strip() or safe_album,
+                title=title,
+                track_no=idx,
+                total_tracks=total_tracks,
+                year=clean_year or None,
+                cover_path=final_cover,
+            )
+            saved_files.append(final_path.name)
+
+    return {
+        "tracks_added": len(saved_files),
+        "output_dir": str(album_dir),
+        "tracks": saved_files,
+    }
+
+
+async def trigger_airsonic_scan(username: str, password: str) -> bool:
+    params = {"u": username, "p": password, "v": "1.15.0", "c": "music-requests", "f": "json"}
+    url = f"{AIRSONIC_URL}/rest/startScan.view"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(url, params=params)
+    except Exception:
+        return False
+    if r.status_code != 200:
+        return False
+    return "status=\"ok\"" in r.text or '"status":"ok"' in r.text
+
+
 # --- qBittorrent ---
 def add_magnet_to_qbit(magnet: str) -> None:
     host, _, port = QBIT_HOST.partition(":")
@@ -305,6 +685,48 @@ async def search_tpb(q: str, _: tuple = Depends(get_auth_header)):
             "magnet": magnet,
         })
     return {"results": out}
+
+
+@app.get("/api/search-youtube")
+async def search_youtube_api(q: str, limit: int | None = None, _: tuple = Depends(get_auth_header)):
+    """Search YouTube for album candidates."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query required")
+    use_limit = limit if limit is not None else YT_SEARCH_LIMIT
+    use_limit = max(1, min(use_limit, 25))
+    try:
+        results = await youtube_search(q.strip(), use_limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"YouTube search failed: {_friendly_ytdlp_error(e)}")
+    return {"results": results}
+
+
+@app.post("/api/rip-youtube")
+async def rip_youtube(req: RipYouTubeRequest, auth: tuple[str, str] = Depends(get_auth_header)):
+    artist = req.artist.strip()
+    album = req.album.strip()
+    if not artist:
+        raise HTTPException(status_code=400, detail="Artist is required")
+    if not album:
+        raise HTTPException(status_code=400, detail="Album is required")
+    try:
+        result = await asyncio.to_thread(_rip_youtube_sync, req.url, artist, album, req.year)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"YouTube rip failed: {_friendly_ytdlp_error(e)}")
+
+    scan_triggered = False
+    if TRIGGER_AIRSONIC_SCAN:
+        scan_triggered = await trigger_airsonic_scan(auth[0], auth[1])
+
+    return {
+        "ok": True,
+        "tracks_added": result["tracks_added"],
+        "output_dir": result["output_dir"],
+        "tracks": result["tracks"],
+        "airsonic_scan_triggered": scan_triggered,
+    }
 
 
 @app.post("/api/add-torrent")

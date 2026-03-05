@@ -1,6 +1,6 @@
 # Music Request
 
-A Jellyseerr-style web app for Airsonic/Subsonic users to request music. Search artists, pick albums or discographies, find torrents via The Pirate Bay (Apibay), and add magnets to qBittorrent with one click.
+A Jellyseerr-style web app for Airsonic/Subsonic users to request music. Search artists, pick albums or discographies, find torrents via The Pirate Bay (Apibay), add magnets to qBittorrent, or rip albums directly from YouTube.
 
 ## Features
 
@@ -11,20 +11,26 @@ A Jellyseerr-style web app for Airsonic/Subsonic users to request music. Search 
 - **TPB search** — Search The Pirate Bay via Apibay (no API key required)
 - **Smart filtering** — Zero-seeder torrents hidden by default with an option to reveal
 - **qBittorrent integration** — Add magnets directly with category `lidarr` for Lidarr import
+- **YouTube album search** — Search YouTube directly for album candidates
+- **YouTube ripping** — Rip audio tracks from YouTube videos/playlists with embedded metadata and cover art
 
 ## Flow
 
 1. Log in with your Airsonic credentials
 2. Search for an artist by name
 3. Choose **Album** (pick one) or **Discography** (full collection)
-4. Search results show torrents; click **Add** to send a magnet to qBittorrent
-5. Torrents are added with category `lidarr` for your existing pipeline (e.g. Lidarr → beets → Airsonic)
+4. For albums, choose source:
+   - **Torrent**: search TPB and add a magnet to qBittorrent
+   - **YouTube**: search YouTube and click **Rip** to import directly
+5. If torrent search returns no album results, click **Search YouTube for this album** as fallback
+6. YouTube rips are written to `YT_IMPORT_DIR` as tagged MP3 files with embedded cover art
 
 ## Prerequisites
 
 - [Docker](https://www.docker.com/) and Docker Compose
 - Airsonic or Subsonic server (for auth)
 - qBittorrent (for adding torrents)
+- `ffmpeg` available in runtime environment (required for YouTube ripping)
 
 ## Quick Start
 
@@ -34,11 +40,13 @@ A Jellyseerr-style web app for Airsonic/Subsonic users to request music. Search 
 # Build and run
 docker build -t music-requests .
 docker run -p 8000:8000 \
+  -v /path/to/music-import:/music-import \
   -e AIRSONIC_URL=http://your-airsonic:4040 \
   -e QBIT_HOST=your-qbittorrent:8080 \
   -e QBIT_USER=admin \
   -e QBIT_PASS=your_password \
   -e QBIT_CATEGORY=lidarr \
+  -e YT_IMPORT_DIR=/music-import \
   music-requests
 ```
 
@@ -57,6 +65,10 @@ music-requests:
     - QBIT_USER=${QBIT_USER}
     - QBIT_PASS=${QBIT_PASS}
     - QBIT_CATEGORY=lidarr
+    - YT_IMPORT_DIR=/music-import
+    - TRIGGER_AIRSONIC_SCAN=true
+  volumes:
+    - /path/to/music-import:/music-import
 ```
 
 **Important:** Use environment variables or secrets for `QBIT_PASS` and similar credentials. Never commit credentials to version control.
@@ -70,6 +82,19 @@ music-requests:
 | `QBIT_USER`    | `admin`                      | qBittorrent Web UI username          |
 | `QBIT_PASS`    | —                            | qBittorrent Web UI password          |
 | `QBIT_CATEGORY`| `lidarr`                     | Category for added torrents          |
+| `YT_IMPORT_DIR`| `/tmp/music-requests-imports`| Output root for ripped YouTube albums |
+| `YT_SEARCH_LIMIT`| `8`                        | Max YouTube candidates returned per search |
+| `YT_AUDIO_QUALITY`| `192`                     | MP3 quality passed to yt-dlp/ffmpeg   |
+| `TRIGGER_AIRSONIC_SCAN`| `true`              | Trigger Subsonic `startScan.view` after YouTube rip |
+| `YT_DLP_COOKIES_FILE`| —                     | Optional cookies file path for yt-dlp |
+
+## YouTube ripping behavior
+
+- Playlist URLs are downloaded track-by-track using playlist order.
+- Single videos with chapters are split into per-chapter tracks.
+- Single videos without chapters are imported as one track.
+- Output files are tagged with Artist, Album, Track Number, Title, and optional Year.
+- Cover art is pulled from the YouTube thumbnail, copied into the album directory (`cover.jpg` / `folder.jpg`), and embedded into MP3 tags.
 
 ## Reverse Proxy (Nginx)
 
@@ -97,7 +122,7 @@ server {
 
 - **Backend:** Python, FastAPI
 - **Frontend:** Vanilla HTML/CSS/JS
-- **APIs:** MusicBrainz, Deezer, Apibay (TPB), Subsonic
+- **APIs:** MusicBrainz, Deezer, Apibay (TPB), YouTube (yt-dlp), Subsonic
 - **Auth:** Basic Auth (credentials verified via Subsonic `ping.view`)
 
 ## Development

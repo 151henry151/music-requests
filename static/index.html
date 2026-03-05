@@ -45,7 +45,9 @@
     .source-label { font-size: 0.85rem; color: #888; margin-right: 0.25rem; }
     .hint { font-size: 0.85rem; color: #888; margin: 0.5rem 0 0.75rem; }
     .status-line { margin-top: 0.75rem; }
-  </style>
+  
+    .status-log { font-size: 0.8rem; color: #888; background: #0f0f1a; padding: 0.75rem; border-radius: 6px; margin-top: 0.5rem; white-space: pre-wrap; max-height: 12rem; overflow-y: auto; }
+</style>
 </head>
 <body>
   <h1>Music Request</h1>
@@ -114,9 +116,15 @@
       <!-- Album YouTube results -->
       <div id="album-yt-flow" class="hidden">
         <div class="step" style="margin-top: 1rem;">4. Pick YouTube result and rip</div>
+        <div class="flex" style="margin-bottom: 0.5rem;">
+          <span class="source-label">Search:</span>
+          <button id="yt-search-mode-album">Albums &amp; playlists</button>
+          <button id="yt-search-mode-song" class="btn-secondary">Single songs</button>
+        </div>
         <p id="album-yt-loading" class="hidden">Searching YouTube...</p>
         <div id="album-yt-results"></div>
         <p id="album-yt-status" class="success status-line hidden"></p>
+        <pre id="album-yt-log" class="status-log hidden"></pre>
       </div>
     </div>
 
@@ -225,9 +233,15 @@
         const row = document.createElement('div');
         row.className = 'torrent-row';
         const duration = v.duration_human || '-';
-        row.innerHTML = '<div><div class="name">' + escapeHtml(v.title || 'Untitled') + '</div><div class="meta"><span>' + escapeHtml(v.channel || 'Unknown channel') + '</span><span>' + escapeHtml(duration) + '</span></div></div><button>Rip</button>';
+        const alreadyRipped = !!v.already_ripped;
+        row.innerHTML = '<div><div class="name">' + escapeHtml(v.title || 'Untitled') + '</div><div class="meta"><span>' + escapeHtml(v.channel || 'Unknown channel') + '</span><span>' + escapeHtml(duration) + '</span></div></div><button>' + (alreadyRipped ? 'Ripped' : 'Rip') + '</button>';
         const btn = row.querySelector('button');
-        btn.onclick = () => ripYouTubeResult(v, album, btn);
+        if (alreadyRipped) {
+          btn.className = 'added';
+          btn.disabled = true;
+        } else {
+          btn.onclick = () => ripYouTubeResult(v, album, btn);
+        }
         containerEl.appendChild(row);
       });
     }
@@ -406,6 +420,15 @@
       }
     }
 
+    let ytSearchMode = 'album';
+    function setYtSearchMode(mode) {
+      ytSearchMode = mode;
+      document.getElementById('yt-search-mode-album').className = mode === 'album' ? '' : 'btn-secondary';
+      document.getElementById('yt-search-mode-song').className = mode === 'song' ? '' : 'btn-secondary';
+    }
+    document.getElementById('yt-search-mode-album').onclick = () => setYtSearchMode('album');
+    document.getElementById('yt-search-mode-song').onclick = () => setYtSearchMode('song');
+
     async function searchAlbumYouTube(album) {
       show(document.getElementById('album-flow'), false);
       show(document.getElementById('album-yt-flow'), true);
@@ -413,11 +436,12 @@
       const resEl = document.getElementById('album-yt-results');
       const loadEl = document.getElementById('album-yt-loading');
       err(document.getElementById('album-yt-status'));
+      show(document.getElementById('album-yt-log'), false);
       resEl.innerHTML = '';
       show(loadEl, true);
       try {
-        const q = currentArtist.name + ' ' + album.title + ' full album';
-        const r = await api('/api/search-youtube?q=' + encodeURIComponent(q));
+        const q = ytSearchMode === 'album' ? (currentArtist.name + ' ' + album.title + ' full album') : (currentArtist.name + ' ' + album.title);
+        const r = await api('/api/search-youtube?q=' + encodeURIComponent(q) + '&mode=' + encodeURIComponent(ytSearchMode));
         const body = await r.json();
         if (!r.ok) throw new Error(body.detail || 'Search failed');
         show(loadEl, false);
@@ -430,10 +454,12 @@
 
     async function ripYouTubeResult(video, album, btn) {
       const statusEl = document.getElementById('album-yt-status');
+      const logEl = document.getElementById('album-yt-log');
       const prevLabel = btn.textContent;
       btn.disabled = true;
       btn.textContent = 'Ripping...';
       err(statusEl, '');
+      show(logEl, false);
       try {
         const payload = {
           url: video.url || video.id,
@@ -444,17 +470,22 @@
         const r = await api('/api/rip-youtube', { method: 'POST', body: JSON.stringify(payload) });
         const body = await r.json();
         if (!r.ok) throw new Error(body.detail || 'Rip failed');
-        const scanMsg = body.airsonic_scan_triggered
-          ? 'Airsonic scan triggered.'
-          : 'Album saved. Airsonic scan was not triggered (or was not permitted).';
+        const scanMsg = body.airsonic_scan_message != null ? body.airsonic_scan_message : (body.airsonic_scan_triggered ? 'Airsonic scan triggered.' : 'Album saved. Airsonic scan was not triggered (or was not permitted).');
         err(statusEl, 'Ripped ' + body.tracks_added + ' track(s) to ' + body.output_dir + '. ' + scanMsg);
         statusEl.classList.remove('error');
         statusEl.classList.add('success');
+        if (body.log && body.log.length) {
+          logEl.textContent = body.log.join('\n');
+          show(logEl, true);
+        }
+        btn.textContent = 'Ripped';
+        btn.className = 'added';
+        btn.disabled = true;
+        btn.onclick = null;
       } catch (e) {
         err(statusEl, e.message || 'Rip failed');
         statusEl.classList.remove('success');
         statusEl.classList.add('error');
-      } finally {
         btn.disabled = false;
         btn.textContent = prevLabel;
       }

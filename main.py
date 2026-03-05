@@ -57,6 +57,7 @@ DEEZER_BASE = "https://api.deezer.com"
 USER_AGENT = "MusicRequests/1.0 (https://music-requests.romptele.com)"
 YT_IMPORT_DIR = os.environ.get("YT_IMPORT_DIR", "/tmp/music-requests-imports")
 YT_SEARCH_LIMIT = max(_env_int("YT_SEARCH_LIMIT", 8), 1)
+YT_RIPPED_IDS_FILE = os.environ.get("YT_RIPPED_IDS_FILE", str(Path(YT_IMPORT_DIR) / ".ripped_youtube_ids.json"))
 YT_AUDIO_QUALITY = (os.environ.get("YT_AUDIO_QUALITY", "192").strip().lower().removesuffix("k") or "192")
 YT_DLP_COOKIES_FILE = os.environ.get("YT_DLP_COOKIES_FILE", "").strip()
 TRIGGER_AIRSONIC_SCAN = os.environ.get("TRIGGER_AIRSONIC_SCAN", "true").strip().lower() in ("1", "true", "yes")
@@ -70,6 +71,30 @@ class LoginRequest(BaseModel):
 
 class AddTorrentRequest(BaseModel):
     magnet: str
+
+
+def _get_ripped_youtube_ids() -> set[str]:
+    try:
+        p = Path(YT_RIPPED_IDS_FILE)
+        if p.exists():
+            data = json.loads(p.read_text())
+            return set(data) if isinstance(data, list) else set(data.get("ids", []))
+    except Exception:
+        pass
+    return set()
+
+
+def _add_ripped_youtube_id(youtube_id: str) -> None:
+    if not youtube_id:
+        return
+    ids = _get_ripped_youtube_ids()
+    ids.add(youtube_id)
+    try:
+        p = Path(YT_RIPPED_IDS_FILE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(list(ids)))
+    except Exception as e:
+        logger.warning("Could not save ripped ID %s: %s", youtube_id, e)
 
 
 class RipYouTubeRequest(BaseModel):
@@ -277,6 +302,27 @@ def _normalize_youtube_url(value: str) -> str:
     raise ValueError("Invalid YouTube URL")
 
 
+def _youtube_url_to_id(url: str) -> str | None:
+    """Return a stable id for this YouTube URL (video id or 'playlist_<id>' for playlists)."""
+    try:
+        normalized = _normalize_youtube_url(url)
+        parsed = urlparse(normalized)
+        qs = parse_qs(parsed.query)
+        list_id = (qs.get("list") or [None])[0]
+        video_id = (qs.get("v") or [None])[0]
+        if list_id:
+            return f"playlist_{list_id}"
+        if video_id and len(str(video_id)) == 11:
+            return str(video_id)
+        if parsed.path.startswith("/watch") and video_id:
+            return str(video_id)
+        if "/playlist" in parsed.path and list_id:
+            return f"playlist_{list_id}"
+        return None
+    except Exception:
+        return None
+
+
 def _yt_dlp_common_opts() -> dict:
     opts = {
         "quiet": True,
@@ -291,12 +337,10 @@ def _yt_dlp_common_opts() -> dict:
     return opts
 
 
-def _youtube_search_sync(query: str, limit: int) -> list[dict]:
+def _youtube_search_sync(query: str, limit: int, mode: str = "album") -> list[dict]:
     opts = _yt_dlp_common_opts()
     opts.update({
         "skip_download": True,
-        # Flat extraction avoids expensive per-video metadata calls that
-        # frequently trigger YouTube anti-bot challenges.
         "extract_flat": "in_playlist",
         "noplaylist": True,
     })
@@ -318,11 +362,16 @@ def _youtube_search_sync(query: str, limit: int) -> list[dict]:
             "url": url,
             "thumbnail": e.get("thumbnail"),
         })
+    # album mode: prefer full albums (long duration first); song mode: single tracks first
+    if mode == "album":
+        out.sort(key=lambda x: (x.get("duration") or 0), reverse=True)
+    else:
+        out.sort(key=lambda x: (x.get("duration") or 0))
     return out
 
 
-async def youtube_search(query: str, limit: int) -> list[dict]:
-    return await asyncio.to_thread(_youtube_search_sync, query, limit)
+async def youtube_search(query: str, limit: int, mode: str = "album") -> list[dict]:
+    return await asyncio.to_thread(_youtube_search_sync, query, limit, mode)
 
 
 def _run_ffmpeg(cmd: list[str]) -> None:
@@ -483,8 +532,10 @@ def _unique_path(path: Path) -> Path:
         i += 1
 
 
-def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None) -> dict:
+def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None, progress_log: list[str] | None = None) -> dict:
     source_url = _normalize_youtube_url(url)
+    if progress_log is not None:
+        progress_log.append(f"Resolved URL: {source_url}")
     import_root = Path(YT_IMPORT_DIR)
     import_root.mkdir(parents=True, exist_ok=True)
 
@@ -494,6 +545,8 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None) -> di
     album_dir_name = f"{safe_album} ({clean_year})" if clean_year else safe_album
     album_dir = import_root / safe_artist / album_dir_name
     album_dir.mkdir(parents=True, exist_ok=True)
+    if progress_log is not None:
+        progress_log.append(f"Output directory: {album_dir}")
 
     with tempfile.TemporaryDirectory(prefix="yt-rip-", dir=str(import_root)) as tmp:
         tmp_dir = Path(tmp)
@@ -501,6 +554,8 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None) -> di
         info_opts.update({"skip_download": True})
         with yt_dlp.YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(source_url, download=False)
+        if progress_log is not None:
+            progress_log.append("Fetched metadata")
 
         cover_path = _download_cover_jpg(_collect_cover_urls(info), tmp_dir)
         final_cover: Path | None = None
@@ -537,6 +592,8 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None) -> di
                 title = (downloaded_info.get("title") or info.get("title") or album).strip()
                 track_sources = [(audio_path, title)]
 
+        if progress_log is not None:
+            progress_log.append(f"Processing {len(track_sources)} track(s)")
         if not track_sources:
             raise RuntimeError("No tracks were produced from the YouTube source")
 
@@ -557,6 +614,8 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None) -> di
                 cover_path=final_cover,
             )
             saved_files.append(final_path.name)
+            if progress_log is not None:
+                progress_log.append(f"Tagged: {final_path.name}")
 
     return {
         "tracks_added": len(saved_files),
@@ -565,19 +624,27 @@ def _rip_youtube_sync(url: str, artist: str, album: str, year: str | None) -> di
     }
 
 
-async def trigger_airsonic_scan(username: str, password: str) -> bool:
+async def trigger_airsonic_scan(username: str, password: str) -> tuple[bool, str]:
     params = {"u": username, "p": password, "v": "1.15.0", "c": "music-requests", "f": "json"}
     url = f"{AIRSONIC_URL}/rest/startScan.view"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(url, params=params)
-    except Exception:
-        return False
+    except Exception as e:
+        msg = f"Scan request failed: {e!s}"
+        logger.warning("trigger_airsonic_scan: %s", msg)
+        return False, msg
     if r.status_code != 200:
-        return False
-    return "status=\"ok\"" in r.text or '"status":"ok"' in r.text
-
-
+        body = (r.text or "")[:200]
+        msg = f"Airsonic returned HTTP {r.status_code}: {body}"
+        return False, msg
+        logger.warning("trigger_airsonic_scan: %s", msg)
+    ok = "status=\"ok\"" in r.text or '"status":"ok"' in r.text
+    if not ok:
+        msg = f"Airsonic scan response indicated failure: {(r.text or '')[:200]}"
+        logger.warning("trigger_airsonic_scan: %s", msg)
+        return False, msg
+    return True, "Scan triggered."
 # --- qBittorrent ---
 def add_magnet_to_qbit(magnet: str) -> None:
     host, _, port = QBIT_HOST.partition(":")
@@ -688,16 +755,26 @@ async def search_tpb(q: str, _: tuple = Depends(get_auth_header)):
 
 
 @app.get("/api/search-youtube")
-async def search_youtube_api(q: str, limit: int | None = None, _: tuple = Depends(get_auth_header)):
-    """Search YouTube for album candidates."""
+async def search_youtube_api(
+    q: str,
+    limit: int | None = None,
+    mode: str = "album",
+    _: tuple = Depends(get_auth_header),
+):
+    """Search YouTube. mode=album prefers full albums (long first); mode=song prefers single tracks."""
     if not q.strip():
         raise HTTPException(status_code=400, detail="Query required")
     use_limit = limit if limit is not None else YT_SEARCH_LIMIT
     use_limit = max(1, min(use_limit, 25))
+    search_mode = "album" if (mode or "").strip().lower() == "album" else "song"
     try:
-        results = await youtube_search(q.strip(), use_limit)
+        results = await youtube_search(q.strip(), use_limit, search_mode)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"YouTube search failed: {_friendly_ytdlp_error(e)}")
+    ripped_ids = _get_ripped_youtube_ids()
+    for r in results:
+        vid = r.get("id") or _youtube_url_to_id(r.get("url") or "")
+        r["already_ripped"] = bool(vid and vid in ripped_ids)
     return {"results": results}
 
 
@@ -709,23 +786,30 @@ async def rip_youtube(req: RipYouTubeRequest, auth: tuple[str, str] = Depends(ge
         raise HTTPException(status_code=400, detail="Artist is required")
     if not album:
         raise HTTPException(status_code=400, detail="Album is required")
+    progress_log: list[str] = []
     try:
-        result = await asyncio.to_thread(_rip_youtube_sync, req.url, artist, album, req.year)
+        result = await asyncio.to_thread(_rip_youtube_sync, req.url, artist, album, req.year, progress_log)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"YouTube rip failed: {_friendly_ytdlp_error(e)}")
 
-    scan_triggered = False
+    rip_id = _youtube_url_to_id(req.url)
+    if rip_id:
+        _add_ripped_youtube_id(rip_id)
+
+    scan_ok, scan_msg = False, "Scan not attempted."
     if TRIGGER_AIRSONIC_SCAN:
-        scan_triggered = await trigger_airsonic_scan(auth[0], auth[1])
+        scan_ok, scan_msg = await trigger_airsonic_scan(auth[0], auth[1])
 
     return {
         "ok": True,
         "tracks_added": result["tracks_added"],
         "output_dir": result["output_dir"],
         "tracks": result["tracks"],
-        "airsonic_scan_triggered": scan_triggered,
+        "airsonic_scan_triggered": scan_ok,
+        "airsonic_scan_message": scan_msg,
+        "log": progress_log,
     }
 
 
